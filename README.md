@@ -4,7 +4,7 @@ WazuhAdmin is a small operational repository for building a Wazuh-based Windows 
 
 | File | Purpose | Where it runs |
 | --- | --- | --- |
-| `WazuhServerSetup` | A short bootstrap checklist for an all-in-one Wazuh server on an Azure Ubuntu VM. | The Ubuntu server |
+| [`WazuhServerSetup.md`](WazuhServerSetup.md) | A structured bootstrap runbook for an all-in-one Wazuh server on an Azure Ubuntu VM. | The Ubuntu server |
 | `GSC-Wazuh-Agent-Config.ps1` | The primary Windows endpoint bootstrap. It installs or rebuilds the Wazuh agent, deploys Sysmon, enables selected Windows telemetry, and safely updates the agent configuration. | Each Windows endpoint, as Administrator |
 | `Invoke-GSC-SmokeTest.ps1` | A benign activity generator used after deployment to verify the collection pipeline. | A configured Windows endpoint |
 | `README.md` | This deployment, operations, and file-reference guide. | Read before operating the deployment |
@@ -41,7 +41,7 @@ Set suitable access controls, retention, encryption, and alerting policies in Wa
 
 ### Wazuh server
 
-1. An Ubuntu Azure VM with at least four vCPUs and 8 GB RAM for approximately 25 endpoints, as stated in `WazuhServerSetup`. Size storage and compute for the actual event rate and retention period; Sysmon and PowerShell collection can substantially increase ingestion volume.
+1. An Ubuntu Azure VM with at least four vCPUs, 8 GB RAM, and 50 GB storage for approximately 25 endpoints and 90 days of queryable/indexed alerts, as stated in [`WazuhServerSetup.md`](WazuhServerSetup.md). Size storage and compute for the actual event rate and retention period; Sysmon and PowerShell collection can substantially increase ingestion volume.
 2. A stable public or private DNS name/IP address that Windows endpoints can reach.
 3. Inbound network rules allowing:
    - TCP **443** to administrators who use the Wazuh dashboard.
@@ -62,7 +62,7 @@ Set suitable access controls, retention, encryption, and alerting policies in Wa
 
 ### 1. Build the Wazuh server
 
-`WazuhServerSetup` is intentionally a concise runbook, not an executable script. On the prepared Ubuntu VM:
+[`WazuhServerSetup.md`](WazuhServerSetup.md) is a server runbook, not an executable script. On the prepared Ubuntu VM:
 
 ```bash
 curl -sO https://packages.wazuh.com/4.14/wazuh-install.sh
@@ -75,7 +75,7 @@ Before deploying endpoints, confirm that the manager is healthy in the dashboard
 
 ### 2. Copy the repository to the endpoint
 
-Copy `GSC-Wazuh-Agent-Config.ps1` and `Invoke-GSC-SmokeTest.ps1` to an administrator-controlled local directory on the endpoint, for example `C:\Install\WazuhAdmin`. Review the exact script revision before execution; the script’s default Wazuh agent version is `4.14.7-1`, while the server checklist downloads the Wazuh 4.14 installer. Keep the server and agent within a supported Wazuh compatibility combination.
+Copy `GSC-Wazuh-Agent-Config.ps1` and `Invoke-GSC-SmokeTest.ps1` to an administrator-controlled local directory on the endpoint, for example `C:\Install\WazuhAdmin`. The current Wazuh release is `4.14.7`, and the bootstrap defaults to the corresponding Windows MSI package `4.14.7-1`; the trailing `-1` is the package revision. The server runbook downloads the maintained `4.14` installation-assistant channel, which installs the current release in that line. Review the [Wazuh quickstart](https://documentation.wazuh.com/current/quickstart.html) before a future deployment, and keep the server and agent within a supported Wazuh compatibility combination.
 
 Open **Windows PowerShell** with **Run as administrator**, change to the copied directory, and execute:
 
@@ -169,7 +169,7 @@ This 1,566-line PowerShell script is the deployment engine. It uses `Set-StrictM
 
 ### Parameters and preflight
 
-`-ManagerAddress` is required. `-AgentName` defaults to `$env:COMPUTERNAME`; `-WazuhVersion` defaults to `4.14.7-1`; `-ManagerPort` and `-RegistrationPort` default to 1514 and 1515. The two port values are constrained to 1–65535.
+`-ManagerAddress` is required. `-AgentName` defaults to `$env:COMPUTERNAME`; `-WazuhVersion` defaults to `4.14.7-1` (Wazuh `4.14.7`, MSI package revision `1`); `-ManagerPort` and `-RegistrationPort` default to 1514 and 1515. The two port values are constrained to 1–65535.
 
 Before changing the endpoint, the script verifies that it is elevated, rejects pre-Windows-10 systems, enables TLS 1.2 when possible, creates its working directories, and checks manager TCP 1514. It checks TCP 1515 as well when `-RebuildWazuh` is selected. Failure at this stage prevents an uninstall or configuration change.
 
