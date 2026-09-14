@@ -4,7 +4,7 @@ WazuhAdmin is a small operational repository for building a Wazuh-based Windows 
 
 | File | Purpose | Where it runs |
 | --- | --- | --- |
-| `WazuhServerSetup` | A short bootstrap checklist for an all-in-one Wazuh server on an Azure Ubuntu VM. | The Ubuntu server |
+| [`WazuhServerSetup.md`](WazuhServerSetup.md) | A structured bootstrap runbook for an all-in-one Wazuh server on an Azure Ubuntu VM. | The Ubuntu server |
 | `GSC-Wazuh-Agent-Config.ps1` | The primary Windows endpoint bootstrap. It installs or rebuilds the Wazuh agent, deploys Sysmon, enables selected Windows telemetry, and safely updates the agent configuration. | Each Windows endpoint, as Administrator |
 | `Invoke-GSC-SmokeTest.ps1` | A benign activity generator used after deployment to verify the collection pipeline. | A configured Windows endpoint |
 | `README.md` | This deployment, operations, and file-reference guide. | Read before operating the deployment |
@@ -41,7 +41,7 @@ Set suitable access controls, retention, encryption, and alerting policies in Wa
 
 ### Wazuh server
 
-1. An Ubuntu Azure VM with at least four vCPUs and 8 GB RAM for approximately 25 endpoints, as stated in `WazuhServerSetup`. Size storage and compute for the actual event rate and retention period; Sysmon and PowerShell collection can substantially increase ingestion volume.
+1. An Ubuntu Azure VM with at least four vCPUs and 8 GB RAM for approximately 25 endpoints, as stated in [`WazuhServerSetup.md`](WazuhServerSetup.md). Size storage and compute for the actual event rate and retention period; Sysmon and PowerShell collection can substantially increase ingestion volume.
 2. A stable public or private DNS name/IP address that Windows endpoints can reach.
 3. Inbound network rules allowing:
    - TCP **443** to administrators who use the Wazuh dashboard.
@@ -62,7 +62,7 @@ Set suitable access controls, retention, encryption, and alerting policies in Wa
 
 ### 1. Build the Wazuh server
 
-`WazuhServerSetup` is intentionally a concise runbook, not an executable script. On the prepared Ubuntu VM:
+[`WazuhServerSetup.md`](WazuhServerSetup.md) is a server runbook, not an executable script. On the prepared Ubuntu VM:
 
 ```bash
 curl -sO https://packages.wazuh.com/4.14/wazuh-install.sh
