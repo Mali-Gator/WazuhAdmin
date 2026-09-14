@@ -1,0 +1,1473 @@
+#!/usr/bin/env bash
+#
+# Granite Shield Cyber - Native Wazuh Sigma Support
+#
+# PURPOSE
+# -------
+# This script adds Sigma-rule capability to an existing Wazuh manager without
+# installing another SIEM, detection engine, dashboard, agent, or long-running
+# third-party service.
+#
+# What it installs:
+#   1. A local Sigma rule workspace under /opt/gsc-sigma
+#   2. A small GSC Sigma -> Wazuh converter written in Python
+#   3. A manual-rule folder for your own Sigma YAML files
+#   4. An OPTIONAL SigmaHQ Windows-rule updater
+#   5. An OPTIONAL systemd timer for automatic rule-content updates
+#   6. Native Wazuh XML rules under /var/ossec/etc/rules/
+#
+# IMPORTANT LIMITATION
+# --------------------
+# Sigma and Wazuh do not have identical rule languages. This converter is
+# intentionally "fail closed":
+#
+#   - Supported Sigma rules are converted to native Wazuh rules.
+#   - Unsupported or ambiguous Sigma rules are SKIPPED and reported.
+#   - The script never silently changes the meaning of a rule just to make it
+#     compile.
+#
+# This first version focuses on the Windows telemetry we have already enabled:
+#   Sysmon 1,3,6,8,9,10,11,12-14,17-18,19-21,22,25,26
+#   PowerShell 4103/4104
+#
+# DEPENDENCIES
+# ------------
+# No Sigma CLI, pySigma backend, third-party SIEM, or OpenSearch plugin is
+# installed.
+#
+# The converter uses:
+#   - python3
+#   - python3-yaml
+#   - curl
+#   - tar
+#
+# python3-yaml is only a YAML parser library. It does not run a service.
+#
+# USAGE
+# -----
+# Basic setup + one safe local test rule:
+#
+#   sudo bash setup-gsc-native-sigma.sh
+#
+# Also download the current SigmaHQ Windows detection-rule CONTENT and compile
+# the subset this converter safely supports:
+#
+#   sudo bash setup-gsc-native-sigma.sh --with-upstream
+#
+# Enable daily automatic upstream content updates after you have tested the
+# resulting detections:
+#
+#   sudo bash setup-gsc-native-sigma.sh --with-upstream --enable-auto-update
+#
+# After installation:
+#
+#   # Put your own Sigma YAML files here:
+#   /opt/gsc-sigma/manual/
+#
+#   # Compile/apply local rules:
+#   sudo /opt/gsc-sigma/bin/gsc-sigma-compile --apply
+#
+#   # Manually refresh SigmaHQ content:
+#   sudo /opt/gsc-sigma/bin/gsc-sigma-update --apply
+#
+# WAZUH DASHBOARD QUERY
+# ---------------------
+#   rule.groups:gsc_sigma
+#
+
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Settings
+# ---------------------------------------------------------------------------
+
+ROOT="/opt/gsc-sigma"
+BIN_DIR="${ROOT}/bin"
+MANUAL_DIR="${ROOT}/manual"
+UPSTREAM_DIR="${ROOT}/upstream"
+GENERATED_DIR="${ROOT}/generated"
+STATE_DIR="${ROOT}/state"
+LOG_DIR="${ROOT}/logs"
+BACKUP_DIR="${ROOT}/backups"
+
+WAZUH_RULE_DIR="/var/ossec/etc/rules"
+WAZUH_RULE_FILE="${WAZUH_RULE_DIR}/gsc_sigma_rules.xml"
+
+COMPILER="${BIN_DIR}/gsc_sigma_compile.py"
+COMPILE_WRAPPER="${BIN_DIR}/gsc-sigma-compile"
+UPDATE_WRAPPER="${BIN_DIR}/gsc-sigma-update"
+
+SIGMAHQ_ARCHIVE_URL="https://github.com/SigmaHQ/sigma/archive/refs/heads/master.tar.gz"
+
+WITH_UPSTREAM=0
+ENABLE_AUTO_UPDATE=0
+
+for arg in "$@"; do
+    case "$arg" in
+        --with-upstream)
+            WITH_UPSTREAM=1
+            ;;
+        --enable-auto-update)
+            ENABLE_AUTO_UPDATE=1
+            WITH_UPSTREAM=1
+            ;;
+        -h|--help)
+            sed -n '1,95p' "$0"
+            exit 0
+            ;;
+        *)
+            echo "[ERROR] Unknown argument: $arg"
+            echo "Use: $0 [--with-upstream] [--enable-auto-update]"
+            exit 1
+            ;;
+    esac
+done
+
+# ---------------------------------------------------------------------------
+# Helper functions
+# ---------------------------------------------------------------------------
+
+step() {
+    echo
+    echo "=== $* ==="
+}
+
+ok() {
+    echo "[OK] $*"
+}
+
+warn() {
+    echo "[WARN] $*"
+}
+
+die() {
+    echo "[ERROR] $*" >&2
+    exit 1
+}
+
+# ---------------------------------------------------------------------------
+# Safety checks
+# ---------------------------------------------------------------------------
+
+[[ "${EUID}" -eq 0 ]] || die "Run this script with sudo/root."
+
+[[ -x /var/ossec/bin/wazuh-analysisd ]] \
+    || die "This does not appear to be a Wazuh manager: /var/ossec/bin/wazuh-analysisd is missing."
+
+systemctl list-unit-files wazuh-manager.service >/dev/null 2>&1 \
+    || die "wazuh-manager.service was not found."
+
+# ---------------------------------------------------------------------------
+# Install only generic parser/download dependencies.
+# No Sigma runtime or external detection product is installed.
+# ---------------------------------------------------------------------------
+
+step "Checking local dependencies"
+
+need_apt=0
+
+command -v python3 >/dev/null 2>&1 || need_apt=1
+command -v curl    >/dev/null 2>&1 || need_apt=1
+command -v tar     >/dev/null 2>&1 || need_apt=1
+
+if ! python3 -c 'import yaml' >/dev/null 2>&1; then
+    need_apt=1
+fi
+
+if [[ "${need_apt}" -eq 1 ]]; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y python3 python3-yaml curl tar
+fi
+
+python3 -c 'import yaml' >/dev/null 2>&1 \
+    || die "Python YAML parser is still unavailable."
+
+ok "Dependencies available"
+
+# ---------------------------------------------------------------------------
+# Create workspace.
+# ---------------------------------------------------------------------------
+
+step "Creating GSC Sigma workspace"
+
+mkdir -p \
+    "${BIN_DIR}" \
+    "${MANUAL_DIR}" \
+    "${UPSTREAM_DIR}" \
+    "${GENERATED_DIR}" \
+    "${STATE_DIR}" \
+    "${LOG_DIR}" \
+    "${BACKUP_DIR}" \
+    "${WAZUH_RULE_DIR}"
+
+chmod 750 "${ROOT}" "${BIN_DIR}" "${STATE_DIR}" "${BACKUP_DIR}"
+chmod 755 "${MANUAL_DIR}" "${UPSTREAM_DIR}" "${GENERATED_DIR}" "${LOG_DIR}"
+
+ok "Workspace created at ${ROOT}"
+
+# ---------------------------------------------------------------------------
+# Create the Sigma -> Wazuh compiler.
+#
+# The converter supports a deliberately conservative subset of Sigma:
+#
+#   Conditions:
+#     selection
+#     selection_a or selection_b
+#     selection_a and selection_b
+#     1 of selection_*
+#     all of selection_*
+#
+#   Field modifiers:
+#     contains
+#     startswith
+#     endswith
+#     re
+#     all
+#
+# More complex conditions (especially filters/correlation) are skipped rather
+# than approximated incorrectly.
+# ---------------------------------------------------------------------------
+
+step "Installing native Sigma-to-Wazuh converter"
+
+cat > "${COMPILER}" <<'PYEOF'
+#!/usr/bin/env python3
+
+"""
+Granite Shield Cyber - Sigma -> native Wazuh compiler.
+
+This is intentionally not a complete implementation of the Sigma
+specification. It converts a conservative subset that maps cleanly onto
+Wazuh XML rules and reports everything else as unsupported.
+
+The goal is semantic safety: skipping a rule is better than silently changing
+its detection logic.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import sys
+from pathlib import Path
+from typing import Any
+from xml.sax.saxutils import escape
+
+import yaml
+
+
+ROOT = Path("/opt/gsc-sigma")
+MANUAL_DIR = ROOT / "manual"
+UPSTREAM_DIR = ROOT / "upstream"
+GENERATED_DIR = ROOT / "generated"
+STATE_DIR = ROOT / "state"
+
+OUTPUT_FILE = GENERATED_DIR / "gsc_sigma_rules.xml"
+REPORT_FILE = GENERATED_DIR / "compile-report.json"
+ID_STATE_FILE = STATE_DIR / "rule-id-map.json"
+
+RULE_ID_MIN = 110000
+RULE_ID_MAX = 119999
+
+# Wazuh rejects very large individual rule strings and can take an
+# impractical amount of time to start when thousands of upstream rules are
+# installed at once.  Keep automatic content deliberately bounded.
+MAX_XML_LINE_LENGTH = int(os.environ.get("GSC_SIGMA_MAX_XML_LINE", "6000"))
+MAX_UPSTREAM_RULES = int(os.environ.get("GSC_SIGMA_MAX_UPSTREAM_RULES", "250"))
+
+
+# ---------------------------------------------------------------------------
+# Sigma severity -> Wazuh level.
+# ---------------------------------------------------------------------------
+
+LEVEL_MAP = {
+    "informational": 3,
+    "low": 5,
+    "medium": 7,
+    "high": 10,
+    "critical": 12,
+}
+
+
+# ---------------------------------------------------------------------------
+# Sigma field -> Wazuh Windows eventchannel field.
+#
+# Keys are normalized to lower case.
+# ---------------------------------------------------------------------------
+
+FIELD_MAP = {
+    "image": "win.eventdata.image",
+    "commandline": "win.eventdata.commandLine",
+    "parentimage": "win.eventdata.parentImage",
+    "parentcommandline": "win.eventdata.parentCommandLine",
+    "currentdirectory": "win.eventdata.currentDirectory",
+    "targetfilename": "win.eventdata.targetFilename",
+    "sourceimage": "win.eventdata.sourceImage",
+    "targetimage": "win.eventdata.targetImage",
+    "destinationip": "win.eventdata.destinationIp",
+    "destinationhostname": "win.eventdata.destinationHostname",
+    "destinationport": "win.eventdata.destinationPort",
+    "sourceip": "win.eventdata.sourceIp",
+    "sourceport": "win.eventdata.sourcePort",
+    "queryname": "win.eventdata.queryName",
+    "user": "win.eventdata.user",
+    "username": "win.eventdata.user",
+    "hashes": "win.eventdata.hashes",
+    "processid": "win.eventdata.processId",
+    "parentprocessid": "win.eventdata.parentProcessId",
+    "sourceprocessid": "win.eventdata.sourceProcessId",
+    "targetprocessid": "win.eventdata.targetProcessId",
+    "grantedaccess": "win.eventdata.grantedAccess",
+    "calltrace": "win.eventdata.callTrace",
+    "pipename": "win.eventdata.pipeName",
+    "targetobject": "win.eventdata.targetObject",
+    "details": "win.eventdata.details",
+    "eventid": "win.system.eventID",
+    "scriptblocktext": "win.eventdata.scriptBlockText",
+    "payload": "win.eventdata.payload",
+    "originalfilename": "win.eventdata.originalFileName",
+    "company": "win.eventdata.company",
+    "product": "win.eventdata.product",
+    "description": "win.eventdata.description",
+    "integritylevel": "win.eventdata.integrityLevel",
+}
+
+
+# ---------------------------------------------------------------------------
+# Sigma Windows logsource -> event constraints we know our endpoint generates.
+#
+# Each mapping returns:
+#   provider regex (optional)
+#   event ID regex
+# ---------------------------------------------------------------------------
+
+LOGSOURCE_MAP = {
+    "process_creation": (
+        r"(?i)^Microsoft-Windows-Sysmon$",
+        r"^1$",
+    ),
+    "network_connection": (
+        r"(?i)^Microsoft-Windows-Sysmon$",
+        r"^3$",
+    ),
+    "driver_load": (
+        r"(?i)^Microsoft-Windows-Sysmon$",
+        r"^6$",
+    ),
+    "create_remote_thread": (
+        r"(?i)^Microsoft-Windows-Sysmon$",
+        r"^8$",
+    ),
+    "raw_access_thread": (
+        r"(?i)^Microsoft-Windows-Sysmon$",
+        r"^9$",
+    ),
+    "process_access": (
+        r"(?i)^Microsoft-Windows-Sysmon$",
+        r"^10$",
+    ),
+    "file_event": (
+        r"(?i)^Microsoft-Windows-Sysmon$",
+        r"^11$",
+    ),
+    "file_creation": (
+        r"(?i)^Microsoft-Windows-Sysmon$",
+        r"^11$",
+    ),
+    "registry_event": (
+        r"(?i)^Microsoft-Windows-Sysmon$",
+        r"^(12|13|14)$",
+    ),
+    "registry_add": (
+        r"(?i)^Microsoft-Windows-Sysmon$",
+        r"^12$",
+    ),
+    "registry_set": (
+        r"(?i)^Microsoft-Windows-Sysmon$",
+        r"^13$",
+    ),
+    "pipe_created": (
+        r"(?i)^Microsoft-Windows-Sysmon$",
+        r"^17$",
+    ),
+    "pipe_connected": (
+        r"(?i)^Microsoft-Windows-Sysmon$",
+        r"^18$",
+    ),
+    "wmi_event": (
+        r"(?i)^Microsoft-Windows-Sysmon$",
+        r"^(19|20|21)$",
+    ),
+    "dns_query": (
+        r"(?i)^Microsoft-Windows-Sysmon$",
+        r"^22$",
+    ),
+    "process_tampering": (
+        r"(?i)^Microsoft-Windows-Sysmon$",
+        r"^25$",
+    ),
+    "file_delete": (
+        r"(?i)^Microsoft-Windows-Sysmon$",
+        r"^26$",
+    ),
+    "ps_script": (
+        r"(?i)^Microsoft-Windows-PowerShell$",
+        r"^4104$",
+    ),
+    "ps_module": (
+        r"(?i)^Microsoft-Windows-PowerShell$",
+        r"^4103$",
+    ),
+}
+
+
+SUPPORTED_MODIFIERS = {
+    "contains",
+    "startswith",
+    "endswith",
+    "re",
+    "all",
+}
+
+
+class UnsupportedRule(Exception):
+    pass
+
+
+def normalize_scalar(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def regex_for_value(value: Any, modifiers: list[str]) -> str:
+    """Convert one Sigma scalar into a PCRE2 pattern."""
+    text = normalize_scalar(value)
+
+    if "re" in modifiers:
+        return text
+
+    escaped = re.escape(text)
+
+    if "contains" in modifiers:
+        body = escaped
+    elif "startswith" in modifiers:
+        body = "^" + escaped
+    elif "endswith" in modifiers:
+        body = escaped + "$"
+    else:
+        body = "^" + escaped + "$"
+
+    # Windows Sigma string comparisons are normally case insensitive.
+    return "(?i)" + body
+
+
+def convert_field_condition(field_expr: str, value: Any) -> list[tuple[str, str]]:
+    """
+    Convert:
+        Image|endswith: '\\powershell.exe'
+    into one or more:
+        (win.eventdata.image, PCRE2)
+    """
+
+    parts = field_expr.split("|")
+    sigma_field = parts[0].strip()
+    modifiers = [p.strip().lower() for p in parts[1:] if p.strip()]
+
+    unknown = [m for m in modifiers if m not in SUPPORTED_MODIFIERS]
+    if unknown:
+        raise UnsupportedRule(
+            f"unsupported modifier(s) on {sigma_field}: {', '.join(unknown)}"
+        )
+
+    wazuh_field = FIELD_MAP.get(sigma_field.lower())
+    if not wazuh_field:
+        raise UnsupportedRule(f"unsupported field: {sigma_field}")
+
+    values = value if isinstance(value, list) else [value]
+
+    if not values:
+        raise UnsupportedRule(f"empty value list for field: {sigma_field}")
+
+    # "|all" means every listed value must match.
+    if "all" in modifiers:
+        return [
+            (wazuh_field, regex_for_value(v, modifiers))
+            for v in values
+        ]
+
+    # Without "|all", a Sigma list is OR. Put alternatives in one regex.
+    patterns = [regex_for_value(v, modifiers) for v in values]
+
+    if len(patterns) == 1:
+        return [(wazuh_field, patterns[0])]
+
+    # Strip duplicate (?i) markers before building one alternation.
+    cleaned = []
+    for pattern in patterns:
+        if pattern.startswith("(?i)"):
+            pattern = pattern[4:]
+        cleaned.append(f"(?:{pattern})")
+
+    return [(wazuh_field, "(?i)(?:" + "|".join(cleaned) + ")")]
+
+
+def expand_selection(selection: Any) -> list[list[tuple[str, str]]]:
+    """
+    Return OR branches.
+
+    A mapping becomes one branch.
+    A list of mappings becomes multiple OR branches.
+    """
+
+    if isinstance(selection, dict):
+        branch: list[tuple[str, str]] = []
+        for field_expr, value in selection.items():
+            branch.extend(convert_field_condition(str(field_expr), value))
+        return [branch]
+
+    if isinstance(selection, list):
+        branches = []
+        for item in selection:
+            if not isinstance(item, dict):
+                raise UnsupportedRule(
+                    "keyword/list detections without fields are not supported"
+                )
+            branches.extend(expand_selection(item))
+        return branches
+
+    raise UnsupportedRule(
+        "selection must be a field mapping or a list of field mappings"
+    )
+
+
+def identifiers_matching(detection: dict[str, Any], glob_expr: str) -> list[str]:
+    # Support patterns such as selection_*.
+    regex = "^" + re.escape(glob_expr).replace(r"\*", ".*") + "$"
+    return sorted(
+        k
+        for k in detection.keys()
+        if k != "condition" and re.match(regex, k)
+    )
+
+
+def condition_to_branches(detection: dict[str, Any]) -> list[list[tuple[str, str]]]:
+    """
+    Support a safe subset of Sigma conditions.
+
+    Supported examples:
+      selection
+      selection_a or selection_b
+      selection_a and selection_b
+      1 of selection_*
+      all of selection_*
+
+    Conditions containing NOT, parentheses, thresholds other than "1 of",
+    or Sigma correlation syntax are intentionally rejected.
+    """
+
+    condition = detection.get("condition")
+    if not isinstance(condition, str):
+        raise UnsupportedRule("condition must be a string")
+
+    condition = " ".join(condition.strip().split())
+
+    if re.search(r"\bnot\b", condition, re.I):
+        raise UnsupportedRule("NOT/filter conditions are not translated in v1")
+
+    if "(" in condition or ")" in condition:
+        raise UnsupportedRule("parenthesized conditions are not translated in v1")
+
+    # 1 of selection_*
+    match = re.fullmatch(r"1 of ([A-Za-z0-9_*.-]+)", condition, re.I)
+    if match:
+        names = identifiers_matching(detection, match.group(1))
+        if not names:
+            raise UnsupportedRule("condition matched no selections")
+
+        result = []
+        for name in names:
+            result.extend(expand_selection(detection[name]))
+        return result
+
+    # all of selection_*
+    match = re.fullmatch(r"all of ([A-Za-z0-9_*.-]+)", condition, re.I)
+    if match:
+        names = identifiers_matching(detection, match.group(1))
+        if not names:
+            raise UnsupportedRule("condition matched no selections")
+
+        # Cartesian merge of possible branches.
+        branches: list[list[tuple[str, str]]] = [[]]
+        for name in names:
+            new_branches = []
+            for existing in branches:
+                for addition in expand_selection(detection[name]):
+                    new_branches.append(existing + addition)
+            branches = new_branches
+        return branches
+
+    # Pure OR of identifiers.
+    if re.fullmatch(
+        r"[A-Za-z0-9_.-]+(?:\s+or\s+[A-Za-z0-9_.-]+)+",
+        condition,
+        re.I,
+    ):
+        result = []
+        for name in re.split(r"\s+or\s+", condition, flags=re.I):
+            if name not in detection:
+                raise UnsupportedRule(f"unknown selection: {name}")
+            result.extend(expand_selection(detection[name]))
+        return result
+
+    # Pure AND of identifiers.
+    if re.fullmatch(
+        r"[A-Za-z0-9_.-]+(?:\s+and\s+[A-Za-z0-9_.-]+)+",
+        condition,
+        re.I,
+    ):
+        names = re.split(r"\s+and\s+", condition, flags=re.I)
+        branches: list[list[tuple[str, str]]] = [[]]
+
+        for name in names:
+            if name not in detection:
+                raise UnsupportedRule(f"unknown selection: {name}")
+
+            new_branches = []
+            for existing in branches:
+                for addition in expand_selection(detection[name]):
+                    new_branches.append(existing + addition)
+            branches = new_branches
+
+        return branches
+
+    # Single identifier.
+    if re.fullmatch(r"[A-Za-z0-9_.-]+", condition):
+        if condition not in detection:
+            raise UnsupportedRule(f"unknown selection: {condition}")
+        return expand_selection(detection[condition])
+
+    raise UnsupportedRule(f"unsupported condition syntax: {condition}")
+
+
+def logsource_constraints(rule: dict[str, Any]) -> tuple[str | None, str]:
+    logsource = rule.get("logsource")
+    if not isinstance(logsource, dict):
+        raise UnsupportedRule("missing/invalid logsource")
+
+    product = str(logsource.get("product", "")).lower()
+    category = str(logsource.get("category", "")).lower()
+    service = str(logsource.get("service", "")).lower()
+
+    if product and product != "windows":
+        raise UnsupportedRule(f"unsupported product: {product}")
+
+    # Service fallback for common PowerShell rules.
+    if not category and service in {"powershell", "powershell-classic"}:
+        category = "ps_script"
+
+    if category not in LOGSOURCE_MAP:
+        raise UnsupportedRule(
+            f"unsupported or missing Windows logsource category: {category or '(none)'}"
+        )
+
+    return LOGSOURCE_MAP[category]
+
+
+def mitre_ids(tags: Any) -> list[str]:
+    if not isinstance(tags, list):
+        return []
+
+    result = []
+    for tag in tags:
+        text = str(tag).lower()
+        match = re.fullmatch(r"attack\.(t\d{4}(?:\.\d{3})?)", text)
+        if match:
+            result.append(match.group(1).upper())
+
+    return sorted(set(result))
+
+
+def safe_group(value: str) -> str:
+    value = value.lower()
+    value = re.sub(r"[^a-z0-9_]+", "_", value)
+    return value.strip("_")[:60]
+
+
+class RuleIdRegistry:
+    def __init__(self, path: Path):
+        self.path = path
+        self.map: dict[str, int] = {}
+
+        if path.exists():
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8"))
+                self.map = {str(k): int(v) for k, v in raw.items()}
+            except Exception:
+                self.map = {}
+
+        self.used = set(self.map.values())
+
+    def get(self, key: str) -> int:
+        if key in self.map:
+            return self.map[key]
+
+        for candidate in range(RULE_ID_MIN, RULE_ID_MAX + 1):
+            if candidate not in self.used:
+                self.map[key] = candidate
+                self.used.add(candidate)
+                return candidate
+
+        raise RuntimeError("GSC Sigma Wazuh rule-ID range is exhausted")
+
+    def save(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temp = self.path.with_suffix(".tmp")
+        temp.write_text(
+            json.dumps(self.map, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        temp.replace(self.path)
+
+
+def rule_identity(rule: dict[str, Any], path: Path) -> str:
+    sigma_id = rule.get("id")
+    if sigma_id:
+        return str(sigma_id)
+
+    seed = f"{path}:{rule.get('title', '')}"
+    return hashlib.sha256(seed.encode()).hexdigest()[:32]
+
+
+def read_sigma_documents(path: Path) -> list[dict[str, Any]]:
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            docs = list(yaml.safe_load_all(handle))
+    except Exception as exc:
+        raise UnsupportedRule(f"YAML parse error: {exc}")
+
+    return [doc for doc in docs if isinstance(doc, dict)]
+
+
+def should_include_upstream(rule: dict[str, Any]) -> tuple[bool, str]:
+    """
+    Keep automatic SigmaHQ content conservative by default.
+
+    Environment overrides:
+      GSC_SIGMA_MIN_LEVEL=low|medium|high|critical
+      GSC_SIGMA_INCLUDE_EXPERIMENTAL=1
+    """
+
+    min_level = os.environ.get("GSC_SIGMA_MIN_LEVEL", "high").lower()
+    include_experimental = (
+        os.environ.get("GSC_SIGMA_INCLUDE_EXPERIMENTAL", "0") == "1"
+    )
+
+    order = {
+        "informational": 0,
+        "low": 1,
+        "medium": 2,
+        "high": 3,
+        "critical": 4,
+    }
+
+    level = str(rule.get("level", "medium")).lower()
+    status = str(rule.get("status", "")).lower()
+
+    if order.get(level, 2) < order.get(min_level, 2):
+        return False, f"below upstream minimum level ({min_level})"
+
+    if status == "experimental" and not include_experimental:
+        return False, "experimental upstream rule"
+
+    return True, ""
+
+
+def collect_rule_files(include_upstream: bool) -> list[tuple[Path, str]]:
+    items: list[tuple[Path, str]] = []
+
+    if include_upstream and UPSTREAM_DIR.exists():
+        for path in sorted(UPSTREAM_DIR.rglob("*.yml")):
+            items.append((path, "upstream"))
+        for path in sorted(UPSTREAM_DIR.rglob("*.yaml")):
+            items.append((path, "upstream"))
+
+    # Manual rules come last so duplicate Sigma IDs can be overridden locally.
+    if MANUAL_DIR.exists():
+        for path in sorted(MANUAL_DIR.rglob("*.yml")):
+            items.append((path, "manual"))
+        for path in sorted(MANUAL_DIR.rglob("*.yaml")):
+            items.append((path, "manual"))
+
+    return items
+
+
+def xml_rule(
+    rule_id: int,
+    level: int,
+    title: str,
+    provider_regex: str | None,
+    event_regex: str,
+    conditions: list[tuple[str, str]],
+    tags: Any,
+) -> str:
+
+    title_xml = escape(title)
+
+    lines = [
+        f'  <rule id="{rule_id}" level="{level}">',
+        "    <if_group>windows</if_group>",
+    ]
+
+    if provider_regex:
+        lines.append(
+            '    <field name="win.system.providerName" type="pcre2">'
+            + escape(provider_regex)
+            + "</field>"
+        )
+
+    lines.append(
+        '    <field name="win.system.eventID" type="pcre2">'
+        + escape(event_regex)
+        + "</field>"
+    )
+
+    for field, pattern in conditions:
+        lines.append(
+            f'    <field name="{escape(field)}" type="pcre2">'
+            + escape(pattern)
+            + "</field>"
+        )
+
+    lines.append(f"    <description>Sigma: {title_xml}</description>")
+
+    ids = mitre_ids(tags)
+    if ids:
+        lines.append("    <mitre>")
+        for mitre_id in ids:
+            lines.append(f"      <id>{escape(mitre_id)}</id>")
+        lines.append("    </mitre>")
+
+    level_group = {
+        12: "sigma_critical",
+        10: "sigma_high",
+        7: "sigma_medium",
+        5: "sigma_low",
+        3: "sigma_informational",
+    }.get(level, "sigma_medium")
+
+    tactic_groups = []
+    if isinstance(tags, list):
+        for tag in tags:
+            tag_text = str(tag)
+            if tag_text.lower().startswith("attack."):
+                tactic_groups.append(safe_group(tag_text.replace(".", "_")))
+
+    groups = ["gsc_sigma", "sigma", level_group] + tactic_groups
+    groups = [g for g in groups if g]
+
+    lines.append("    <group>" + ",".join(sorted(set(groups))) + ",</group>")
+    lines.append("  </rule>")
+
+    return "\n".join(lines)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--include-upstream",
+        action="store_true",
+        help="Compile supported rules from /opt/gsc-sigma/upstream too.",
+    )
+    args = parser.parse_args()
+
+    registry = RuleIdRegistry(ID_STATE_FILE)
+
+    compiled: list[str] = []
+    report = {
+        "compiled_rules": [],
+        "skipped_rules": [],
+        "source_files": 0,
+    }
+
+    # Keyed by Sigma ID so manual rules can replace upstream rules.
+    chosen: dict[str, tuple[dict[str, Any], Path, str]] = {}
+
+    for path, source in collect_rule_files(args.include_upstream):
+        report["source_files"] += 1
+
+        try:
+            docs = read_sigma_documents(path)
+        except UnsupportedRule as exc:
+            report["skipped_rules"].append(
+                {
+                    "file": str(path),
+                    "source": source,
+                    "reason": str(exc),
+                }
+            )
+            continue
+
+        for doc in docs:
+            identity = rule_identity(doc, path)
+
+            if source == "upstream":
+                include, reason = should_include_upstream(doc)
+                if not include:
+                    report["skipped_rules"].append(
+                        {
+                            "file": str(path),
+                            "source": source,
+                            "sigma_id": identity,
+                            "title": doc.get("title", ""),
+                            "reason": reason,
+                        }
+                    )
+                    continue
+
+            # Manual rules overwrite same-ID upstream rule.
+            chosen[identity] = (doc, path, source)
+
+    # Manual rules are never subject to the upstream quantity cap. Select the
+    # highest-severity upstream rules deterministically, then cap the set so a
+    # content update cannot unexpectedly overwhelm Wazuh startup.
+    upstream_identities = [
+        identity for identity, (rule, _path, source) in chosen.items()
+        if source == "upstream"
+    ]
+    upstream_identities.sort(
+        key=lambda identity: (
+            -LEVEL_MAP.get(
+                str(chosen[identity][0].get("level", "medium")).lower(), 7
+            ),
+            str(chosen[identity][0].get("title", "")).lower(),
+            identity,
+        )
+    )
+    allowed_upstream = set(upstream_identities[:MAX_UPSTREAM_RULES])
+
+    for identity in upstream_identities[MAX_UPSTREAM_RULES:]:
+        rule, path, source = chosen[identity]
+        report["skipped_rules"].append(
+            {
+                "file": str(path),
+                "source": source,
+                "sigma_id": identity,
+                "title": rule.get("title", ""),
+                "reason": (
+                    "upstream safety cap reached "
+                    f"({MAX_UPSTREAM_RULES} selected rules)"
+                ),
+            }
+        )
+
+    selected_identities = [
+        identity for identity, (_rule, _path, source) in chosen.items()
+        if source != "upstream" or identity in allowed_upstream
+    ]
+
+    for identity in sorted(selected_identities):
+        rule, path, source = chosen[identity]
+        title = str(rule.get("title", path.name))
+        level_name = str(rule.get("level", "medium")).lower()
+        level = LEVEL_MAP.get(level_name, 7)
+
+        # Sigma correlation rules are not converted in v1.
+        if "correlation" in rule:
+            report["skipped_rules"].append(
+                {
+                    "file": str(path),
+                    "source": source,
+                    "sigma_id": identity,
+                    "title": title,
+                    "reason": "Sigma correlation rules are unsupported in v1",
+                }
+            )
+            continue
+
+        detection = rule.get("detection")
+
+        try:
+            if not isinstance(detection, dict):
+                raise UnsupportedRule("missing/invalid detection section")
+
+            provider_regex, event_regex = logsource_constraints(rule)
+            branches = condition_to_branches(detection)
+
+            if not branches:
+                raise UnsupportedRule("condition produced no branches")
+
+            for branch_index, branch in enumerate(branches):
+                id_key = f"{identity}:{branch_index}"
+                wazuh_id = registry.get(id_key)
+
+                rendered_rule = xml_rule(
+                    rule_id=wazuh_id,
+                    level=level,
+                    title=title,
+                    provider_regex=provider_regex,
+                    event_regex=event_regex,
+                    conditions=branch,
+                    tags=rule.get("tags", []),
+                )
+
+                longest_line = max(
+                    (len(line) for line in rendered_rule.splitlines()),
+                    default=0,
+                )
+                if longest_line > MAX_XML_LINE_LENGTH:
+                    raise UnsupportedRule(
+                        "generated XML line too long for Wazuh: "
+                        f"{longest_line} characters "
+                        f"(limit {MAX_XML_LINE_LENGTH})"
+                    )
+
+                compiled.append(rendered_rule)
+
+                report["compiled_rules"].append(
+                    {
+                        "file": str(path),
+                        "source": source,
+                        "sigma_id": identity,
+                        "title": title,
+                        "branch": branch_index,
+                        "wazuh_rule_id": wazuh_id,
+                        "level": level,
+                    }
+                )
+
+        except UnsupportedRule as exc:
+            report["skipped_rules"].append(
+                {
+                    "file": str(path),
+                    "source": source,
+                    "sigma_id": identity,
+                    "title": title,
+                    "reason": str(exc),
+                }
+            )
+
+    registry.save()
+
+    GENERATED_DIR.mkdir(parents=True, exist_ok=True)
+
+    xml = [
+        "<group name=\"gsc_sigma,sigma,\">",
+        "",
+        "  <!--",
+        "    AUTO-GENERATED by Granite Shield Cyber Sigma compiler.",
+        "    Do not edit this XML directly; edit Sigma YAML in:",
+        "      /opt/gsc-sigma/manual/",
+        "  -->",
+        "",
+    ]
+
+    xml.extend(compiled)
+    xml.append("")
+    xml.append("</group>")
+    xml.append("")
+
+    OUTPUT_FILE.write_text("\n".join(xml), encoding="utf-8")
+
+    REPORT_FILE.write_text(
+        json.dumps(report, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+
+    print(f"Source files considered: {report['source_files']}")
+    print(f"Wazuh rules generated:   {len(report['compiled_rules'])}")
+    print(f"Sigma rules skipped:     {len(report['skipped_rules'])}")
+    print(f"Generated XML:           {OUTPUT_FILE}")
+    print(f"Compatibility report:    {REPORT_FILE}")
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+PYEOF
+
+chmod 750 "${COMPILER}"
+
+python3 -m py_compile "${COMPILER}"
+ok "Sigma converter installed"
+
+# ---------------------------------------------------------------------------
+# Create a small wrapper that:
+#   - compiles
+#   - backs up current Wazuh Sigma XML
+#   - installs generated XML
+#   - validates Wazuh
+#   - rolls back on failure
+#   - restarts Wazuh only when the generated rule set actually changed
+# ---------------------------------------------------------------------------
+
+cat > "${COMPILE_WRAPPER}" <<'SHEOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="/opt/gsc-sigma"
+GENERATED="${ROOT}/generated/gsc_sigma_rules.xml"
+REPORT="${ROOT}/generated/compile-report.json"
+TARGET="/var/ossec/etc/rules/gsc_sigma_rules.xml"
+BACKUPS="${ROOT}/backups"
+STAMP="$(date +%Y%m%d-%H%M%S)"
+
+INCLUDE_UPSTREAM=0
+APPLY=0
+
+for arg in "$@"; do
+    case "$arg" in
+        --include-upstream) INCLUDE_UPSTREAM=1 ;;
+        --apply) APPLY=1 ;;
+        *)
+            echo "Usage: $0 [--include-upstream] [--apply]"
+            exit 1
+            ;;
+    esac
+done
+
+[[ "${EUID}" -eq 0 ]] || {
+    echo "[ERROR] Run with sudo/root."
+    exit 1
+}
+
+args=()
+[[ "${INCLUDE_UPSTREAM}" -eq 1 ]] && args+=(--include-upstream)
+
+/opt/gsc-sigma/bin/gsc_sigma_compile.py "${args[@]}"
+
+if [[ "${APPLY}" -ne 1 ]]; then
+    echo
+    echo "[INFO] Compile only. Nothing was installed into Wazuh."
+    echo "[INFO] Review: ${REPORT}"
+    exit 0
+fi
+
+mkdir -p "${BACKUPS}"
+
+old_hash=""
+new_hash="$(sha256sum "${GENERATED}" | awk '{print $1}')"
+
+if [[ -f "${TARGET}" ]]; then
+    old_hash="$(sha256sum "${TARGET}" | awk '{print $1}')"
+fi
+
+if [[ "${old_hash}" == "${new_hash}" ]]; then
+    echo "[OK] Generated Sigma Wazuh rules are unchanged. No restart needed."
+    exit 0
+fi
+
+backup=""
+
+if [[ -f "${TARGET}" ]]; then
+    backup="${BACKUPS}/gsc_sigma_rules.xml.${STAMP}.bak"
+    cp -a "${TARGET}" "${backup}"
+    echo "[OK] Existing Sigma rule file backed up to ${backup}"
+fi
+
+cp -a "${GENERATED}" "${TARGET}"
+chown root:wazuh "${TARGET}" 2>/dev/null || true
+chmod 640 "${TARGET}"
+
+echo "[INFO] Validating Wazuh analysis configuration..."
+
+if ! /var/ossec/bin/wazuh-analysisd -t; then
+    echo "[ERROR] Wazuh validation failed. Rolling back."
+
+    if [[ -n "${backup}" && -f "${backup}" ]]; then
+        cp -a "${backup}" "${TARGET}"
+    else
+        rm -f "${TARGET}"
+    fi
+
+    exit 1
+fi
+
+echo "[OK] Wazuh validation passed."
+
+restart_failed=0
+if ! systemctl restart wazuh-manager; then
+    restart_failed=1
+else
+    sleep 4
+    systemctl is-active --quiet wazuh-manager || restart_failed=1
+fi
+
+if [[ "${restart_failed}" -eq 1 ]]; then
+    echo "[ERROR] Wazuh manager failed or timed out after rule deployment. Rolling back."
+
+    systemctl stop wazuh-manager >/dev/null 2>&1 || true
+    pkill -f '/var/ossec/bin/wazuh-analysisd -t' >/dev/null 2>&1 || true
+
+    if [[ -n "${backup}" && -f "${backup}" ]]; then
+        cp -a "${backup}" "${TARGET}"
+    else
+        rm -f "${TARGET}"
+    fi
+
+    systemctl reset-failed wazuh-manager || true
+    if ! systemctl start wazuh-manager; then
+        echo "[CRITICAL] Previous rules were restored, but Wazuh still did not start."
+        echo "[CRITICAL] Inspect: journalctl -u wazuh-manager -n 100 --no-pager"
+        exit 2
+    fi
+
+    echo "[OK] Previous rules restored and wazuh-manager recovered."
+    exit 1
+fi
+
+echo "[OK] Sigma-derived Wazuh rules applied successfully."
+echo "[OK] wazuh-manager is running."
+SHEOF
+
+chmod 750 "${COMPILE_WRAPPER}"
+
+# ---------------------------------------------------------------------------
+# Create upstream SigmaHQ rule-content updater.
+#
+# This downloads RULE CONTENT only. No Sigma program/runtime is installed.
+#
+# It copies only SigmaHQ's generic Windows rules from:
+#   rules/windows/
+#
+# The converter still skips unsupported rules.
+# ---------------------------------------------------------------------------
+
+cat > "${UPDATE_WRAPPER}" <<'SHEOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="/opt/gsc-sigma"
+UPSTREAM="${ROOT}/upstream"
+LOG_DIR="${ROOT}/logs"
+URL="https://github.com/SigmaHQ/sigma/archive/refs/heads/master.tar.gz"
+
+APPLY=0
+
+for arg in "$@"; do
+    case "$arg" in
+        --apply) APPLY=1 ;;
+        *)
+            echo "Usage: $0 [--apply]"
+            exit 1
+            ;;
+    esac
+done
+
+[[ "${EUID}" -eq 0 ]] || {
+    echo "[ERROR] Run with sudo/root."
+    exit 1
+}
+
+mkdir -p "${LOG_DIR}"
+
+tmp="$(mktemp -d)"
+trap 'rm -rf "${tmp}"' EXIT
+
+archive="${tmp}/sigma.tar.gz"
+
+echo "[INFO] Downloading current SigmaHQ rule content..."
+curl -fL --retry 3 --connect-timeout 20 \
+    "${URL}" \
+    -o "${archive}"
+
+tar -xzf "${archive}" -C "${tmp}"
+
+src="$(find "${tmp}" -maxdepth 3 -type d -path '*/rules/windows' | head -n 1)"
+
+if [[ -z "${src}" || ! -d "${src}" ]]; then
+    echo "[ERROR] Could not find SigmaHQ rules/windows in downloaded archive."
+    exit 1
+fi
+
+new_upstream="${tmp}/windows"
+mkdir -p "${new_upstream}"
+cp -a "${src}/." "${new_upstream}/"
+
+# Replace upstream rule content atomically.
+old_upstream="${ROOT}/upstream.old"
+
+rm -rf "${old_upstream}"
+if [[ -d "${UPSTREAM}" ]]; then
+    mv "${UPSTREAM}" "${old_upstream}"
+fi
+
+mv "${new_upstream}" "${UPSTREAM}"
+
+if [[ "${APPLY}" -eq 1 ]]; then
+    if /opt/gsc-sigma/bin/gsc-sigma-compile --include-upstream --apply; then
+        rm -rf "${old_upstream}"
+        echo "[OK] SigmaHQ update compiled and applied."
+    else
+        echo "[ERROR] New upstream content did not apply cleanly."
+        rm -rf "${UPSTREAM}"
+        if [[ -d "${old_upstream}" ]]; then
+            mv "${old_upstream}" "${UPSTREAM}"
+        fi
+        exit 1
+    fi
+else
+    rm -rf "${old_upstream}"
+    /opt/gsc-sigma/bin/gsc-sigma-compile --include-upstream
+    echo "[INFO] Upstream rules updated and compiled, but not installed into Wazuh."
+fi
+SHEOF
+
+chmod 750 "${UPDATE_WRAPPER}"
+
+ok "Compile/update commands installed"
+
+# ---------------------------------------------------------------------------
+# Install one benign manual Sigma rule so we can prove the entire path works.
+#
+# It matches the marker generated by the AV-safe smoke test's PowerShell 4104
+# event. This is a test rule, not a production threat rule.
+# ---------------------------------------------------------------------------
+
+SAMPLE_RULE="${MANUAL_DIR}/gsc_test_powershell_smoke.yml"
+
+if [[ ! -f "${SAMPLE_RULE}" ]]; then
+    cat > "${SAMPLE_RULE}" <<'YMLEOF'
+title: GSC Sigma Pipeline Smoke Test
+id: 91cd1fe5-9cdb-4778-a18d-bad0f7290001
+status: stable
+description: Detects the harmless Granite Shield PowerShell smoke-test marker to validate the Sigma-to-Wazuh pipeline.
+author: Granite Shield Cyber
+date: 2026-09-13
+tags:
+    - attack.execution
+    - attack.t1059.001
+logsource:
+    product: windows
+    category: ps_script
+detection:
+    selection:
+        ScriptBlockText|contains: GSC_SMOKE_TEST_POWERSHELL
+    condition: selection
+falsepositives:
+    - Expected when running the Granite Shield telemetry smoke test.
+level: medium
+YMLEOF
+
+    ok "Created safe Sigma pipeline test rule"
+else
+    ok "Safe Sigma pipeline test rule already exists"
+fi
+
+# ---------------------------------------------------------------------------
+# Optional first upstream download.
+# ---------------------------------------------------------------------------
+
+if [[ "${WITH_UPSTREAM}" -eq 1 ]]; then
+    step "Downloading current SigmaHQ Windows rule content"
+    "${UPDATE_WRAPPER}"
+fi
+
+# ---------------------------------------------------------------------------
+# Compile and apply.
+#
+# Default setup applies MANUAL rules only.
+# --with-upstream applies the currently supported subset of upstream too.
+# ---------------------------------------------------------------------------
+
+step "Compiling Sigma rules"
+
+if [[ "${WITH_UPSTREAM}" -eq 1 ]]; then
+    "${COMPILE_WRAPPER}" --include-upstream --apply
+else
+    "${COMPILE_WRAPPER}" --apply
+fi
+
+# ---------------------------------------------------------------------------
+# Optional daily automatic rule-content update.
+#
+# The timer is intentionally NOT enabled unless the administrator explicitly
+# passed --enable-auto-update.
+#
+# Automatic updates:
+#   1. Download new SigmaHQ Windows rule content
+#   2. Compile only supported rules
+#   3. Validate native Wazuh XML
+#   4. Apply atomically
+#   5. Restart Wazuh only if the generated rule set changed
+# ---------------------------------------------------------------------------
+
+if [[ "${ENABLE_AUTO_UPDATE}" -eq 1 ]]; then
+    step "Enabling automatic Sigma rule-content updates"
+
+    cat > /etc/systemd/system/gsc-sigma-update.service <<'UNITEOF'
+[Unit]
+Description=Granite Shield Sigma rule-content update
+After=network-online.target wazuh-manager.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/gsc-sigma/bin/gsc-sigma-update --apply
+UNITEOF
+
+    cat > /etc/systemd/system/gsc-sigma-update.timer <<'UNITEOF'
+[Unit]
+Description=Daily Granite Shield Sigma rule-content update
+
+[Timer]
+OnCalendar=*-*-* 03:17:00
+RandomizedDelaySec=1800
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNITEOF
+
+    systemctl daemon-reload
+    systemctl enable --now gsc-sigma-update.timer
+
+    ok "Automatic update timer enabled"
+else
+    warn "Automatic SigmaHQ updates are NOT enabled."
+    echo "      Enable later with:"
+    echo "      sudo systemctl enable --now gsc-sigma-update.timer"
+    echo "      (Run this setup once with --enable-auto-update first.)"
+fi
+
+# ---------------------------------------------------------------------------
+# Final summary
+# ---------------------------------------------------------------------------
+
+step "Finished"
+
+echo "Manual Sigma rules:"
+echo "  ${MANUAL_DIR}"
+echo
+echo "Generated native Wazuh rules:"
+echo "  ${WAZUH_RULE_FILE}"
+echo
+echo "Compatibility report:"
+echo "  ${GENERATED_DIR}/compile-report.json"
+echo
+echo "Compile/apply after adding a manual YAML rule:"
+echo "  sudo ${COMPILE_WRAPPER} --apply"
+echo
+echo "Refresh SigmaHQ Windows content manually:"
+echo "  sudo ${UPDATE_WRAPPER} --apply"
+echo
+echo "Wazuh dashboard query:"
+echo "  rule.groups:gsc_sigma"
+echo
+echo "FIRST TEST:"
+echo "  1. Run your AV-safe Invoke-GSC-SmokeTest.ps1 on KALI_JS."
+echo "  2. In Wazuh Discover, search:"
+echo "       rule.groups:gsc_sigma"
+echo "  3. You should see:"
+echo "       Sigma: GSC Sigma Pipeline Smoke Test"
+echo
+echo "IMPORTANT:"
+echo "  Review ${GENERATED_DIR}/compile-report.json."
+echo "  Rules listed under skipped_rules were NOT approximated or silently enabled."
