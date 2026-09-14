@@ -1,0 +1,12 @@
+# Setup an Azure VM (Ubuntu  w/ 4 processors and 8GB of memory minimum for up to 25 endpoints) https://documentation.wazuh.com/current/quickstart.html
+1. Download and run the Wazuh installation assistant.
+  `curl -sO https://packages.wazuh.com/4.14/wazuh-install.sh && sudo bash ./wazuh-install.sh -a`
+
+Once the assistant finishes the installation, the output shows the access credentials and a message that confirms that the installation was successful.
+
+
+2. Access the Wazuh web interface with https://AzureVMIPAddress and your credentials:
+Username: admin
+Password: <ADMIN_PASSWORD>
+
+Once Wazuh Server is setup, we can begin deploying agents.
