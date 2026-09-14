@@ -13,10 +13,21 @@ For an environment with up to approximately 25 endpoints, provision an Azure VM 
 | Operating system | Supported Ubuntu release |
 | CPU | 4 vCPUs |
 | Memory | 8 GB RAM |
+| Storage | 50 GB for 90 days of queryable/indexed alerts |
 | Network | Stable DNS name or IP address reachable by managed endpoints |
 | Administrator access | SSH access with `sudo` permission |
 
 Size disk capacity, compute, and memory for the actual event volume and retention period. Windows Sysmon, Security auditing, and PowerShell telemetry can produce substantially more data than a basic endpoint deployment.
+
+## Version baseline
+
+This runbook tracks **Wazuh v4.14.7**, the current Wazuh release when this document was updated. The installation assistant is intentionally downloaded from the `4.14` package channel:
+
+```text
+https://packages.wazuh.com/4.14/wazuh-install.sh
+```
+
+The channel path identifies the maintained 4.14 release line; it is not a request to install only version 4.14.0. Before a future deployment, verify the supported release and installation command in the [Wazuh quickstart](https://documentation.wazuh.com/current/quickstart.html). Keep the manager and Windows agent within the same supported Wazuh release line.
 
 Allow only the required inbound traffic in the Azure network security group and any host firewall:
 
