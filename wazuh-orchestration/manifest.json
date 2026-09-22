@@ -1,0 +1,45 @@
+{
+  "GeneratedUtc": "2026-09-22T23:47:03.9037396Z",
+  "Files": [
+    {
+      "File": "Disable-BitdefenderAntispam.ps1",
+      "Length": 14695,
+      "Sha256": "67D46EC97C88A5725A779791F0EAD44635A8B092BD2B90970C35C2EA368689A9"
+    },
+    {
+      "File": "Disable-BitdefenderCryptominingProtection.ps1",
+      "Length": 14725,
+      "Sha256": "8EA778F665D71085770A4A15CEC501231CB040E4EC881C397C1C5730A7AE3316"
+    },
+    {
+      "File": "Disable-BitdefenderFirewall.ps1",
+      "Length": 14695,
+      "Sha256": "6EEB3A43D498D578D75861633B14EC03F067B0B29C825384C810EEE5603AF64B"
+    },
+    {
+      "File": "Disable-BitdefenderRansomwareRemediation.ps1",
+      "Length": 14723,
+      "Sha256": "A090CB3B01BF0E8C5E2E80A462591DAC534C507BDCE087884735E8F96431A77B"
+    },
+    {
+      "File": "Enable-BitdefenderAntispam.ps1",
+      "Length": 14693,
+      "Sha256": "4F2AB0F718A8C850012FEB03C5A5D50E5CF43E01AB4E982C3AC5961DB8C4D5C4"
+    },
+    {
+      "File": "Enable-BitdefenderCryptominingProtection.ps1",
+      "Length": 14723,
+      "Sha256": "62316DC6DA4A0D384C67577A0A1D43CC332E1548AF4CE3D7569EB5A8A3773A01"
+    },
+    {
+      "File": "Enable-BitdefenderFirewall.ps1",
+      "Length": 14693,
+      "Sha256": "0A0C3728EE634A11B0CB6DB31F110A2B50960EAD7C6926F53A1A4B8167C6E49F"
+    },
+    {
+      "File": "Enable-BitdefenderRansomwareRemediation.ps1",
+      "Length": 14721,
+      "Sha256": "1380D48A346D869A82348B846A50A64BDC12BCAB0CED792A44120022CED5B9C0"
+    }
+  ]
+}

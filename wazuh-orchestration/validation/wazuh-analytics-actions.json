@@ -1,0 +1,34 @@
+{
+  "validated_at_local": "2026-09-22T16:44:52-07:00",
+  "windows_powershell": "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+  "test_modes": [
+    "direct interactive execution",
+    "forced Wazuh Session 0 relay through TASK_LOGON_INTERACTIVE_TOKEN"
+  ],
+  "syntax_validation": {
+    "powershell_version": "5.1",
+    "scripts_checked": 8,
+    "parse_errors": 0
+  },
+  "actions": [
+    {"script":"Enable-BitdefenderRansomwareRemediation.ps1","requested":"On","before":"Off","after":"On","artifact_before":"Off","artifact_after":"On","exit_code":0,"passed":true},
+    {"script":"Disable-BitdefenderRansomwareRemediation.ps1","requested":"Off","before":"On","after":"Off","artifact_before":"On","artifact_after":"Off","exit_code":0,"passed":true},
+    {"script":"Enable-BitdefenderCryptominingProtection.ps1","requested":"On","before":"Off","after":"On","artifact_before":"Off","artifact_after":"On","exit_code":0,"passed":true},
+    {"script":"Disable-BitdefenderCryptominingProtection.ps1","requested":"Off","before":"On","after":"Off","artifact_before":"On","artifact_after":"Off","exit_code":0,"passed":true},
+    {"script":"Disable-BitdefenderFirewall.ps1","requested":"Off","before":"On","after":"Off","artifact_before":"On","artifact_after":"Off","exit_code":0,"passed":true},
+    {"script":"Enable-BitdefenderFirewall.ps1","requested":"On","before":"Off","after":"On","artifact_before":"Off","artifact_after":"On","exit_code":0,"passed":true},
+    {"script":"Disable-BitdefenderAntispam.ps1","requested":"Off","before":"On","after":"Off","artifact_before":"On","artifact_after":"Off","exit_code":0,"passed":true},
+    {"script":"Enable-BitdefenderAntispam.ps1","requested":"On","before":"Off","after":"On","artifact_before":"Off","artifact_after":"On","exit_code":0,"passed":true}
+  ],
+  "cleanup": {
+    "temporary_scheduled_tasks": 0,
+    "temporary_job_directories": 0,
+    "preserved_last_result_files": 8
+  },
+  "final_state": {
+    "RansomwareRemediation": "Off",
+    "CryptominingProtection": "Off",
+    "Firewall": "On",
+    "Antispam": "On"
+  }
+}

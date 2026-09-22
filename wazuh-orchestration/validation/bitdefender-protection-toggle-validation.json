@@ -1,0 +1,60 @@
+{
+  "validated_at_local": "2026-09-21T20:41:50-07:00",
+  "host": "Windows",
+  "executor": "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+  "script": "Set-BitdefenderProtection.ps1",
+  "dependencies": [
+    "Windows PowerShell 5.1",
+    ".NET UIAutomationClient",
+    ".NET UIAutomationTypes"
+  ],
+  "results": [
+    {
+      "setting": "RansomwareRemediation",
+      "automation_id": "28",
+      "initial": "Off",
+      "opposite": "On",
+      "restored": "Off",
+      "artifact": "settings.RansomwareRemediation.Settings.module_state",
+      "artifact_values": "0 -> 1 -> 0",
+      "passed": true
+    },
+    {
+      "setting": "CryptominingProtection",
+      "automation_id": "33",
+      "initial": "Off",
+      "opposite": "On",
+      "restored": "Off",
+      "artifact": "C:\\Program Files\\Bitdefender\\Bitdefender Security\\settings\\vshield.xml",
+      "artifact_values": "6481 bytes -> 6498 bytes -> 6481 bytes, with a new last-write timestamp at each transition",
+      "passed": true
+    },
+    {
+      "setting": "Firewall",
+      "automation_id": "2",
+      "initial": "On",
+      "opposite": "Off",
+      "restored": "On",
+      "artifact": "settings.Firewall.Backup.Settings.Settings.enabled",
+      "artifact_values": "true -> false -> true",
+      "passed": true
+    },
+    {
+      "setting": "Antispam",
+      "automation_id": "3",
+      "initial": "On",
+      "opposite": "Off",
+      "restored": "On",
+      "artifact": "settings\\as\\<user-SID>\\antispam.xml / settings.ScanSpam",
+      "artifact_values": "1 -> 0 -> 1",
+      "passed": true
+    }
+  ],
+  "final_state": {
+    "RansomwareRemediation": "Off",
+    "CryptominingProtection": "Off",
+    "Firewall": "On",
+    "Antispam": "On"
+  },
+  "interactive_session_required": true
+}
