@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
   Granite Shield Cyber - Windows Wazuh/EDR endpoint bootstrap.
 
@@ -12,6 +12,7 @@
     - Enable Windows security auditing and PowerShell logging.
     - Enable/cap important Windows Event Log channels as circular buffers.
     - Configure Wazuh to collect security-relevant specialty channels.
+    - Validate the selected antivirus and collect its malware detections.
     - Add targeted Wazuh FIM for:
         * small script/source files, including content changes
         * common ransomware-targeted documents (metadata/hash only)
@@ -32,17 +33,21 @@
 
 .EXAMPLE
   # Fresh endpoint or update an existing endpoint in place:
-  .\Deploy-GSC-WazuhEndpoint.ps1 -ManagerAddress "analytics.example.com"
+  .\GSC-Wazuh-Agent-Config.ps1
+
+.EXAMPLE
+  # Bitdefender Total Security endpoint with rich incident collection:
+  .\GSC-Wazuh-Agent-Config.ps1 -av Bitdefender
 
 .EXAMPLE
   # Full Wazuh wipe/reinstall test on an already-configured endpoint:
-  .\Deploy-GSC-WazuhEndpoint.ps1 `
+  .\GSC-Wazuh-Agent-Config.ps1 `
       -ManagerAddress "analytics.example.com" `
       -RebuildWazuh
 
 .EXAMPLE
   # Custom endpoint name:
-  .\Deploy-GSC-WazuhEndpoint.ps1 `
+  .\GSC-Wazuh-Agent-Config.ps1 `
       -ManagerAddress "10.10.10.10" `
       -AgentName "CLIENT-PC-01" `
       -RebuildWazuh
@@ -53,9 +58,12 @@
 
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)]
     [ValidateNotNullOrEmpty()]
-    [string]$ManagerAddress,
+    [string]$ManagerAddress = "analytics.graniteshieldcyber.com",
+
+    [Alias("av")]
+    [ValidateSet("Defender","Bitdefender","Other")]
+    [string]$Antivirus = "Defender",
 
     [ValidateNotNullOrEmpty()]
     [string]$AgentName = $env:COMPUTERNAME,
@@ -229,7 +237,140 @@ if (-not (Test-IsAdministrator)) {
 }
 
 if ([Environment]::OSVersion.Version.Major -lt 10) {
-    throw "This bootstrap is intended for Windows 10/11 or Windows Server equivalents."
+    throw "This bootstrap is intended for Windows 10/11 workstations."
+}
+$operatingSystem = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
+if ([int]$operatingSystem.ProductType -ne 1) {
+    throw "This antivirus validation requires a Windows 10/11 workstation; Windows Server is not supported by this bootstrap."
+}
+
+# Query Windows Security Center's supported product API; State 0 means active.
+$wscSource = @'
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+namespace GscAv {
+    [ComImport, Guid("722A338C-6E8E-4E72-AC27-1417FB0C81C2"),
+     InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    internal interface IProductList {
+        void GetTypeInfoCount(out uint count);
+        void GetTypeInfo(uint index, uint lcid, out IntPtr info);
+        void GetIDsOfNames();
+        void Invoke();
+        void Initialize(uint provider);
+        void GetCount(out int count);
+        void GetItem(uint index, out IProduct product);
+    }
+    [ComImport, Guid("8C38232E-3A45-4A27-92B0-1A16A975F669"),
+     InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    internal interface IProduct {
+        void GetTypeInfoCount(out uint count);
+        void GetTypeInfo(uint index, uint lcid, out IntPtr info);
+        void GetIDsOfNames();
+        void Invoke();
+        void GetName([MarshalAs(UnmanagedType.BStr)] out string name);
+        void GetState(out int state);
+        void GetSignatureStatus(out int status);
+    }
+    public sealed class AvProduct {
+        public string Name { get; set; }
+        public int State { get; set; }
+        public int SignatureStatus { get; set; }
+    }
+    public static class WscReader {
+        public static AvProduct[] GetAntivirusProducts() {
+            var list = new List<AvProduct>();
+            var t = Type.GetTypeFromCLSID(new Guid("17072F7B-9ABE-4A74-A261-1EB76B55107A"), true);
+            var obj = Activator.CreateInstance(t);
+            try {
+                var products = (IProductList)obj;
+                products.Initialize(4);
+                int count;
+                products.GetCount(out count);
+                for (uint i = 0; i < count; i++) {
+                    IProduct product;
+                    products.GetItem(i, out product);
+                    try {
+                        string name;
+                        int state, sig;
+                        product.GetName(out name);
+                        product.GetState(out state);
+                        product.GetSignatureStatus(out sig);
+                        list.Add(new AvProduct { Name = name, State = state, SignatureStatus = sig });
+                    } finally {
+                        if (product != null) Marshal.ReleaseComObject(product);
+                    }
+                }
+            } finally {
+                if (obj != null) Marshal.ReleaseComObject(obj);
+            }
+            return list.ToArray();
+        }
+    }
+}
+'@
+if (-not ('GscAv.WscReader' -as [type])) {
+    Add-Type -TypeDefinition $wscSource -ErrorAction Stop
+}
+
+Write-Step "Validating antivirus protection"
+$avProducts = @([GscAv.WscReader]::GetAntivirusProducts())
+$activeAv = @($avProducts | Where-Object { $_.State -eq 0 })
+if ($activeAv.Count -eq 0) {
+    throw "Windows Security Center reports no active antivirus product. Repair antivirus protection before deploying Wazuh."
+}
+
+$selectedPattern = switch ($Antivirus) {
+    "Bitdefender" { "(?i)Bitdefender" }
+    "Defender" { "(?i)Microsoft Defender|Windows Defender" }
+    "Other" { "(?i)^(?!.*(?:Bitdefender|Microsoft Defender|Windows Defender)).+" }
+}
+$selectedAv = @($activeAv | Where-Object { $_.Name -match $selectedPattern })
+if ($selectedAv.Count -eq 0) {
+    $runningNames = ($activeAv | ForEach-Object { $_.Name }) -join ", "
+    throw "Selected -av $Antivirus is not active. Windows Security Center reports: $runningNames. Specify the active AV or repair it."
+}
+Write-OK "Active antivirus: $(($selectedAv | ForEach-Object { $_.Name }) -join ', ')"
+
+$DefenderScanStatus = "Not checked"
+if ($Antivirus -eq "Defender") {
+    $mpStatus = Get-MpComputerStatus -ErrorAction Stop
+    if (-not $mpStatus.AntivirusEnabled -or -not $mpStatus.RealTimeProtectionEnabled) {
+        throw "Microsoft Defender is registered, but antivirus or real-time protection is off."
+    }
+    $mpPreference = Get-MpPreference -ErrorAction Stop
+    if ([int]$mpPreference.ScanScheduleDay -eq 8) {
+        Write-Step "Enabling Defender scheduled quick scans"
+        Set-MpPreference -ScanScheduleDay Everyday -ScanParameters QuickScan -ErrorAction Stop
+        $mpPreference = Get-MpPreference -ErrorAction Stop
+        if ([int]$mpPreference.ScanScheduleDay -eq 8) {
+            throw "Defender scheduled scanning remains disabled after Set-MpPreference."
+        }
+        $DefenderScanStatus = "Enabled scheduled quick scans"
+    } else {
+        $DefenderScanStatus = "Scheduled scans already enabled"
+    }
+    Write-OK $DefenderScanStatus
+} elseif ($Antivirus -eq "Bitdefender") {
+    $rcaPath = "C:\ProgramData\Bitdefender\Bitdefender Security App\ctc\rca"
+    if (-not (Test-Path -LiteralPath $rcaPath -PathType Container)) {
+        throw "Bitdefender is active, but its local incident directory is absent: $rcaPath. Rich incident collection cannot be installed."
+    }
+    try {
+        $mpMode = [string](Get-MpComputerStatus -ErrorAction Stop).AMRunningMode
+    } catch {
+        $mpMode = "Unavailable"
+    }
+    if ($mpMode -eq "SxS Passive Mode") {
+        $DefenderScanStatus = "Limited periodic scanning already enabled"
+        Write-OK $DefenderScanStatus
+    } else {
+        $DefenderScanStatus = "Limited periodic scanning requires the Windows Security app"
+        Write-Warn "Defender limited periodic scanning is not confirmed. With Bitdefender active, enable it in Windows Security > Virus & threat protection > Microsoft Defender Antivirus options. Microsoft does not provide a supported policy or PowerShell switch for this mode."
+    }
+} else {
+    $DefenderScanStatus = "Limited periodic scanning must be checked in Windows Security for this third-party AV"
+    Write-Warn $DefenderScanStatus
 }
 
 try {
@@ -247,6 +388,9 @@ $report.Add("Started: $(Get-Date -Format o)")
 $report.Add("Computer: $env:COMPUTERNAME")
 $report.Add("Agent name: $AgentName")
 $report.Add("Manager: $ManagerAddress")
+$report.Add("Selected antivirus: $Antivirus")
+$report.Add("Active antivirus: $(($selectedAv | ForEach-Object { $_.Name }) -join ', ')")
+$report.Add("Defender scanning: $DefenderScanStatus")
 $report.Add("RebuildWazuh: $RebuildWazuh")
 $report.Add("Manager event port: $ManagerPort")
 $report.Add("Manager enrollment port: $RegistrationPort")
@@ -532,6 +676,268 @@ if (-not (Test-Path -LiteralPath $WazuhConf)) {
     throw "Wazuh configuration is missing: $WazuhConf"
 }
 
+# The Bitdefender option embeds the tested read-only RCA collector so one script
+# is sufficient on an endpoint. Defender endpoints never install it.
+$BitdefenderCollectorInstalled = $false
+if ($Antivirus -eq "Bitdefender") {
+    Write-Step "Installing Bitdefender incident collector"
+    $collectorDirectory = "C:\ProgramData\BitdefenderWazuh"
+    $collectorPath = Join-Path $collectorDirectory "Collect-BitdefenderIncidents.ps1"
+    $collectorLines = @(
+        '<#'
+        '.SYNOPSIS'
+        'Emit selected Bitdefender Total Security RCA incidents as Wazuh-ready JSON lines.'
+        '.DESCRIPTION'
+        'Read-only collection of Bitdefender''s local RCA JSON and quarantine index.'
+        'No Bitdefender product installation or Wazuh remote commands are performed.'
+        'The RCA format is undocumented and must be checked after product upgrades.'
+        '#>'
+        '[CmdletBinding()]'
+        'param('
+        '    [string]$RcaDirectory = ''C:\ProgramData\Bitdefender\Bitdefender Security App\ctc\rca'','
+        '    [string]$QuarantineDatabase = ''C:\ProgramData\Bitdefender\Desktop\Quarantine\cache.db'','
+        '    [string]$OutputDirectory = ''C:\ProgramData\BitdefenderWazuh'','
+        '    [string]$StatePath,'
+        '    [switch]$InitializeOnly'
+        ')'
+        ''
+        'Set-StrictMode -Version 2.0'
+        '$ErrorActionPreference = ''Stop'''
+        'if (-not $StatePath) { $StatePath = Join-Path $OutputDirectory ''collector-state.json'' }'
+        ''
+        'function ConvertTo-NormalPath([string]$Path) {'
+        '    if (-not $Path) { return '''' }'
+        '    $value = $Path -replace ''^[\\]{2}\?[\\]'', '''''
+        '    return $value.Trim().ToLowerInvariant()'
+        '}'
+        ''
+        'function Get-ShortName([string]$Path) {'
+        '    if (-not $Path) { return '''' }'
+        '    return [IO.Path]::GetFileName($Path)'
+        '}'
+        ''
+        'function Get-Sha256([string]$Value) {'
+        '    $sha = [Security.Cryptography.SHA256]::Create()'
+        '    try {'
+        '        $bytes = [Text.Encoding]::UTF8.GetBytes($Value)'
+        '        return ([BitConverter]::ToString($sha.ComputeHash($bytes))).Replace(''-'', '''').ToLowerInvariant()'
+        '    } finally { $sha.Dispose() }'
+        '}'
+        ''
+        'function Get-ProcessChain($Incident) {'
+        '    $processes = @($Incident.nodes | Where-Object { $_.type -eq ''node_process'' -and $_.extra -and $_.extra.process_path })'
+        '    $current = $processes | Where-Object {'
+        '        $_.extra.pid -eq $Incident.real_trigger_pid -and'
+        '        (ConvertTo-NormalPath $_.extra.process_path) -eq (ConvertTo-NormalPath $Incident.trigger_process_path)'
+        '    } | Sort-Object event_time -Descending | Select-Object -First 1'
+        '    $names = New-Object ''System.Collections.Generic.List[string]'''
+        '    $paths = New-Object ''System.Collections.Generic.List[string]'''
+        '    $timeline = New-Object ''System.Collections.Generic.List[string]'''
+        '    $seen = New-Object ''System.Collections.Generic.HashSet[string]'''
+        '    for ($i = 0; $i -lt 6 -and $current; $i++) {'
+        '        $path = [string]$current.extra.process_path'
+        '        $name = Get-ShortName $path'
+        '        if ($name -match ''^(svchost|services|wininit|system)\.exe$'') { break }'
+        '        $key = "{0}:{1}" -f $current.extra.pid, $current.extra.pid_timestamp'
+        '        if (-not $seen.Add($key)) { break }'
+        '        $names.Insert(0, $name)'
+        '        $paths.Insert(0, $path)'
+        '        $started = [DateTimeOffset]::FromUnixTimeMilliseconds([long]$current.event_time).ToLocalTime().ToString(''yyyy-MM-dd HH:mm:ss.fff zzz'')'
+        '        $timeline.Insert(0, "$name ($started)")'
+        '        $parentPid = $current.extra.parent_pid'
+        '        if (-not $parentPid) { break }'
+        '        $current = $processes | Where-Object {'
+        '            $_.extra.pid -eq $parentPid -and $_.event_time -le $current.event_time'
+        '        } | Sort-Object event_time -Descending | Select-Object -First 1'
+        '    }'
+        '    return [pscustomobject]@{'
+        '        Names = @($names.ToArray())'
+        '        Paths = @($paths.ToArray())'
+        '        Summary = ($names.ToArray() -join '' -> '')'
+        '        Timeline = ($timeline.ToArray() -join '' -> '')'
+        '    }'
+        '}'
+        ''
+        '# Windows 10/11 includes winsqlite3.dll. We use it only to confirm quarantine.'
+        '# A failed or inaccessible index leaves remediation as unconfirmed.'
+        '$sqliteSource = @'''
+        'using System;'
+        'using System.Collections.Generic;'
+        'using System.Runtime.InteropServices;'
+        'using System.Text;'
+        'public sealed class BdQuarantineRow {'
+        '  public string Path;'
+        '  public string Threat;'
+        '  public string Sha256;'
+        '  public string QuarantineId;'
+        '  public long QuarantineTime;'
+        '  public long Size;'
+        '}'
+        'public static class BdSqliteReadOnly {'
+        '  [DllImport("winsqlite3.dll", CallingConvention=CallingConvention.Cdecl, CharSet=CharSet.Ansi)]'
+        '  static extern int sqlite3_open_v2(string file, out IntPtr db, int flags, IntPtr vfs);'
+        '  [DllImport("winsqlite3.dll", CallingConvention=CallingConvention.Cdecl)]'
+        '  static extern int sqlite3_prepare_v2(IntPtr db, byte[] sql, int length, out IntPtr stmt, IntPtr tail);'
+        '  [DllImport("winsqlite3.dll", CallingConvention=CallingConvention.Cdecl)]'
+        '  static extern int sqlite3_step(IntPtr stmt);'
+        '  [DllImport("winsqlite3.dll", CallingConvention=CallingConvention.Cdecl)]'
+        '  static extern IntPtr sqlite3_column_text(IntPtr stmt, int index);'
+        '  [DllImport("winsqlite3.dll", CallingConvention=CallingConvention.Cdecl)]'
+        '  static extern int sqlite3_column_bytes(IntPtr stmt, int index);'
+        '  [DllImport("winsqlite3.dll", CallingConvention=CallingConvention.Cdecl)]'
+        '  static extern long sqlite3_column_int64(IntPtr stmt, int index);'
+        '  [DllImport("winsqlite3.dll", CallingConvention=CallingConvention.Cdecl)]'
+        '  static extern int sqlite3_finalize(IntPtr stmt);'
+        '  [DllImport("winsqlite3.dll", CallingConvention=CallingConvention.Cdecl)]'
+        '  static extern int sqlite3_close(IntPtr db);'
+        '  static string Text(IntPtr stmt, int i) {'
+        '    IntPtr p = sqlite3_column_text(stmt, i);'
+        '    int n = sqlite3_column_bytes(stmt, i);'
+        '    if (p == IntPtr.Zero || n <= 0) return "";'
+        '    byte[] b = new byte[n]; Marshal.Copy(p, b, 0, n);'
+        '    return Encoding.UTF8.GetString(b);'
+        '  }'
+        '  public static List<BdQuarantineRow> Read(string file) {'
+        '    var rows = new List<BdQuarantineRow>();'
+        '    IntPtr db = IntPtr.Zero, stmt = IntPtr.Zero;'
+        '    try {'
+        '      if (sqlite3_open_v2(file, out db, 1, IntPtr.Zero) != 0) throw new Exception("SQLite read-only open failed");'
+        '      byte[] sql = Encoding.UTF8.GetBytes("SELECT path,threat,sha256,quarId,quartime,size FROM entries\0");'
+        '      if (sqlite3_prepare_v2(db, sql, sql.Length, out stmt, IntPtr.Zero) != 0) throw new Exception("SQLite quarantine query failed");'
+        '      int rc;'
+        '      while ((rc = sqlite3_step(stmt)) == 100) {'
+        '        rows.Add(new BdQuarantineRow {'
+        '          Path=Text(stmt,0), Threat=Text(stmt,1), Sha256=Text(stmt,2),'
+        '          QuarantineId=Text(stmt,3), QuarantineTime=sqlite3_column_int64(stmt,4),'
+        '          Size=sqlite3_column_int64(stmt,5)'
+        '        });'
+        '      }'
+        '      if (rc != 101) throw new Exception("SQLite quarantine read failed");'
+        '      return rows;'
+        '    } finally {'
+        '      if (stmt != IntPtr.Zero) sqlite3_finalize(stmt);'
+        '      if (db != IntPtr.Zero) sqlite3_close(db);'
+        '    }'
+        '  }'
+        '}'
+        '''@'
+        ''
+        'if (-not (''BdSqliteReadOnly'' -as [type])) { Add-Type -TypeDefinition $sqliteSource -ErrorAction Stop }'
+        ''
+        'if (-not (Test-Path -LiteralPath $RcaDirectory -PathType Container)) {'
+        '    throw "Bitdefender RCA directory is unavailable: $RcaDirectory"'
+        '}'
+        'if (-not (Test-Path -LiteralPath $OutputDirectory)) {'
+        '    New-Item -Path $OutputDirectory -ItemType Directory -Force | Out-Null'
+        '}'
+        ''
+        '$quarantineRows = @()'
+        'if (Test-Path -LiteralPath $QuarantineDatabase -PathType Leaf) {'
+        '    try { $quarantineRows = @([BdSqliteReadOnly]::Read($QuarantineDatabase)) }'
+        '    catch { Write-Warning "Quarantine index could not be read: $($_.Exception.Message)" }'
+        '}'
+        ''
+        '$seen = New-Object ''System.Collections.Generic.HashSet[string]'''
+        'if (Test-Path -LiteralPath $StatePath -PathType Leaf) {'
+        '    $prior = Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json'
+        '    if ($prior.version -eq 2) {'
+        '        foreach ($id in @($prior.seen)) { if ($id) { [void]$seen.Add([string]$id) } }'
+        '    }'
+        '}'
+        ''
+        '$pending = New-Object ''System.Collections.Generic.List[object]'''
+        '$files = @(Get-ChildItem -LiteralPath $RcaDirectory -Filter ''*.dat'' -File -ErrorAction Stop)'
+        'foreach ($file in $files) {'
+        '    try { $incident = Get-Content -LiteralPath $file.FullName -Raw | ConvertFrom-Json }'
+        '    catch { Write-Warning "Skipping incomplete RCA file $($file.Name): $($_.Exception.Message)"; continue }'
+        '    if ($incident.event_name -ne ''rca_insight'' -or -not $incident.real_trigger_detection_name -or -not $incident.real_trigger_file_path) { continue }'
+        '    $timeMs = [long]$incident.event_time'
+        '    if ($timeMs -le 0) { continue }'
+        '    $threat = [string]$incident.real_trigger_detection_name'
+        '    $target = [string]$incident.real_trigger_file_path'
+        '    $chain = Get-ProcessChain $incident'
+        '    $matched = $quarantineRows | Where-Object {'
+        '        (ConvertTo-NormalPath $_.Path) -eq (ConvertTo-NormalPath $target) -and'
+        '        $_.Threat -eq $threat -and'
+        '        [Math]::Abs(([long]$_.QuarantineTime * 1000) - $timeMs) -lt 900000'
+        '    } | Sort-Object QuarantineTime -Descending | Select-Object -First 1'
+        '    $identitySeed = $(if ($matched) {'
+        '        "quarantine|{0}|{1}|{2}" -f $matched.QuarantineId, $threat, $target'
+        '    } else {'
+        '        "rca|{0}|{1}|{2}|{3}" -f $incident.rca_id, $incident.real_trigger_pid, $threat, $target'
+        '    })'
+        '    $identity = Get-Sha256 ("v2|$identitySeed")'
+        '    if ($seen.Contains($identity)) { continue }'
+        '    $testFile = $threat -match ''^EICAR-Test-File'''
+        '    $risk = $(if ($testFile) { '''' } else { @($incident.attack_types | Where-Object { $_ }) -join '', '' })'
+        '    $detectionTimeMs = $(if ($matched) { [long]$matched.QuarantineTime * 1000 } else { $timeMs })'
+        '    $event = [ordered]@{'
+        '        detection_time_utc = [DateTimeOffset]::FromUnixTimeMilliseconds($detectionTimeMs).UtcDateTime.ToString(''o'')'
+        '        rca_generated_utc = [DateTimeOffset]::FromUnixTimeMilliseconds($timeMs).UtcDateTime.ToString(''o'')'
+        '        integration = ''bitdefender_consumer'''
+        '        event_type = ''malware_detection'''
+        '        schema_version = 2'
+        '        event_id = $identity'
+        '        computer_name = $env:COMPUTERNAME'
+        '        detection_layer = ''Bitdefender RCA'''
+        '        threat_name = $threat'
+        '        file_path = $target'
+        '        remediation = $(if ($matched) { ''quarantined'' } else { ''unconfirmed'' })'
+        '        quarantine_confirmed = [bool]$matched'
+        '        quarantine_sha256 = $(if ($matched) { $matched.Sha256 } else { '''' })'
+        '        trigger_process = [string]$incident.trigger_process_path'
+        '        trigger_parent_process = [string]$incident.trigger_parent_process_path'
+        '        process_chain = $chain.Summary'
+        '        process_timeline_local = $chain.Timeline'
+        '        process_chain_paths = $chain.Paths -join '' | '''
+        '        rca_incident_attack_types = $risk'
+        '        alternative_outcome = $(if ($testFile) { ''Simulation only: EICAR is harmless.'' } elseif ($risk) { "Potential risk categories associated with the RCA incident: $risk. This is a vendor classification, not observed harm or a prediction for this file." } else { ''No specific alternative outcome was recorded.'' })'
+        '        simulated_test = [bool]$testFile'
+        '        source = ''Bitdefender RCA JSON'''
+        '    }'
+        '    $pending.Add([pscustomobject]$event)'
+        '    [void]$seen.Add($identity)'
+        '}'
+        ''
+        'if (-not $InitializeOnly -and $pending.Count -gt 0) {'
+        '    $outFile = Join-Path $OutputDirectory (''events-{0}.jsonl'' -f [DateTime]::UtcNow.ToString(''yyyy-MM-dd''))'
+        '    $utf8 = New-Object Text.UTF8Encoding($false)'
+        '    $stream = New-Object IO.StreamWriter($outFile, $true, $utf8)'
+        '    try {'
+        '        foreach ($event in $pending) {'
+        '            $stream.WriteLine(($event | ConvertTo-Json -Compress -Depth 5))'
+        '            Write-Output $event'
+        '        }'
+        '    } finally { $stream.Dispose() }'
+        '}'
+        ''
+        '$state = [pscustomobject]@{ version = 2; seen = @($seen | Select-Object -Last 2000) }'
+        '$temp = "$StatePath.tmp"'
+        '[IO.File]::WriteAllText($temp, ($state | ConvertTo-Json -Compress -Depth 3), (New-Object Text.UTF8Encoding($false)))'
+        'Move-Item -LiteralPath $temp -Destination $StatePath -Force'
+        ''
+    )
+    Ensure-Directory $collectorDirectory
+    [System.IO.File]::WriteAllLines($collectorPath, [string[]]$collectorLines,
+        (New-Object System.Text.UTF8Encoding($false)))
+    & icacls.exe $collectorDirectory /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "Could not restrict collector directory permissions." }
+
+    $collectorTaskName = "GSC Bitdefender Incident Collector"
+    $powershellExe = Join-Path $env:WINDIR "System32\WindowsPowerShell\v1.0\powershell.exe"
+    $collectorArguments = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}"' -f $collectorPath
+    $taskAction = New-ScheduledTaskAction -Execute $powershellExe -Argument $collectorArguments
+    $taskTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
+        -RepetitionInterval (New-TimeSpan -Minutes 1) -RepetitionDuration (New-TimeSpan -Days 3650)
+    $taskPrincipal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+    $taskSettings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 1) -MultipleInstances IgnoreNew
+    Register-ScheduledTask -TaskName $collectorTaskName -Action $taskAction -Trigger $taskTrigger `
+        -Principal $taskPrincipal -Settings $taskSettings -Force | Out-Null
+    Start-ScheduledTask -TaskName $collectorTaskName
+    $BitdefenderCollectorInstalled = $true
+    Write-OK "Bitdefender incident collector scheduled; events: $collectorDirectory\events-*.jsonl"
+}
+
 # -----------------------------
 # Windows audit policy
 # -----------------------------
@@ -808,6 +1214,13 @@ $ConfiguredChannels = New-Object System.Collections.Generic.List[string]
 foreach ($kv in $EventChannelCapsMB.GetEnumerator()) {
     if (Set-EventChannelCircular -Channel $kv.Key -MaxSizeMB $kv.Value) {
         $ConfiguredChannels.Add($kv.Key)
+    }
+}
+
+if ($Antivirus -in @('Defender','Bitdefender')) {
+    $defenderChannel = Get-WinEvent -ListLog 'Microsoft-Windows-Windows Defender/Operational' -ErrorAction Stop
+    if (-not $defenderChannel.IsEnabled) {
+        throw 'Defender Operational event channel is disabled; Wazuh cannot collect Defender detection events.'
     }
 }
 
@@ -1352,6 +1765,23 @@ foreach ($channel in ($channelsToCollect | Select-Object -Unique)) {
     $localfileLines.Add("  </localfile>")
 }
 
+if ($Antivirus -eq "Bitdefender") {
+    $incidentLocation = 'C:\ProgramData\BitdefenderWazuh\events-*.jsonl'
+    $sharedAgentConf = Join-Path $WazuhDir 'shared\agent.conf'
+    $sharedText = if (Test-Path -LiteralPath $sharedAgentConf) {
+        Get-Content -LiteralPath $sharedAgentConf -Raw
+    } else { '' }
+    if ($sharedText.IndexOf($incidentLocation, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+        Write-Info 'Bitdefender incidents are already collected by a manager group.'
+    } elseif ($confText.IndexOf($incidentLocation, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) {
+        $localfileLines.Add('  <localfile>')
+        $localfileLines.Add("    <location>$incidentLocation</location>")
+        $localfileLines.Add('    <log_format>json</log_format>')
+        $localfileLines.Add('    <label key="@source">bitdefender-incident</label>')
+        $localfileLines.Add('  </localfile>')
+    }
+}
+
 if (-not $SkipLnkMetadata) {
     $escapedLnkLog = Escape-XmlText $LnkLog
 
@@ -1511,6 +1941,7 @@ $report.Add("Sysmon config: $sysmonConfig")
 $report.Add("Script content capture skipped: $SkipScriptContentCapture")
 $report.Add("Browser credential auditing skipped: $SkipBrowserCredentialAuditing")
 $report.Add("LNK metadata skipped: $SkipLnkMetadata")
+$report.Add("Bitdefender collector installed: $BitdefenderCollectorInstalled")
 $report.Add("")
 $report.Add("Local log design:")
 $report.Add("  Windows EVTX channels are circular/bounded.")
@@ -1538,6 +1969,11 @@ $report.Add("  Sysmon 29  Executable file creation")
 $report.Add("  Windows Security process/logon/account/audit events")
 $report.Add("  PowerShell Script Block + Module Logging")
 $report.Add("  Defender / Task Scheduler / WMI / Code Integrity / RDP / BITS")
+if ($Antivirus -eq "Bitdefender") {
+    $report.Add("  Bitdefender RCA incident timeline / quarantine events")
+} elseif ($Antivirus -eq "Defender") {
+    $report.Add("  Defender Operational malware detections and remediation events")
+}
 $report.Add("  Targeted browser credential DB read auditing")
 $report.Add("  Wazuh FIM script content + ransomware-targeted files")
 $report.Add("  LNK target/arguments/hash metadata")
@@ -1551,11 +1987,16 @@ Write-Host "WAZUH / ENDPOINT TELEMETRY BASELINE APPLIED" -ForegroundColor Green
 Write-Host ""
 Write-Host "Manager:        $ManagerAddress"
 Write-Host "Agent name:     $AgentName"
+Write-Host "Antivirus:      $Antivirus"
+Write-Host "Defender scans: $DefenderScanStatus"
 Write-Host "Wazuh backup:   $backup"
 Write-Host "Install report: $InstallReport"
 Write-Host ""
 Write-Host "No Windows Event Log was cleared." -ForegroundColor Green
 Write-Host "Local EVTX logs are bounded circular buffers." -ForegroundColor Green
+if ($Antivirus -eq "Bitdefender") {
+    Write-Host "Bitdefender incident JSONL: C:\ProgramData\BitdefenderWazuh\events-*.jsonl"
+}
 Write-Host ""
 Write-Host "IMPORTANT:" -ForegroundColor Yellow
 Write-Host "  If this was a Wazuh rebuild and enrollment reports a duplicate agent name,"
