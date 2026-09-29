@@ -1,13 +1,15 @@
-﻿<#
+<#
 .SYNOPSIS
-Sets Bitdefender protection switches through Windows UI Automation.
+Sets Bitdefender protection switches and consumer firewall IP rules through Windows UI Automation.
 .DESCRIPTION
 Requires Windows PowerShell 5.1 and an unlocked interactive desktop.
 Supports the original overview switches, Advanced Threat Defense, Exploit
 Detection, and Antivirus > Advanced switches. Uses exact English UI labels
 for new settings; fails if a control cannot be identified uniquely.
+Can also add a consumer Bitdefender Firewall rule for a local or remote IP
+address by creating an all-applications rule with Allow or Deny permission.
 UI state is the verification source, not proof of the engine's internal state.
-No service, driver, registry, or protected configuration changes are made.
+No direct service, driver, registry, or protected-file changes are made.
 .EXAMPLE
 .\Set-BitdefenderProtection.ps1 -Setting AdvancedThreatDefense -State Off
 .EXAMPLE
@@ -16,6 +18,10 @@ No service, driver, registry, or protected configuration changes are made.
 .\Set-BitdefenderProtection.ps1 -Setting ScanCommandLine -State On
 .EXAMPLE
 .\Set-BitdefenderProtection.ps1 -Setting ScanScripts -State Status -CurrentPage -ListControls
+.EXAMPLE
+.\Set-BitdefenderProtection.ps1 -FirewallIpAddress 192.168.1.50 -FirewallIpAction Allow
+.EXAMPLE
+.\Set-BitdefenderProtection.ps1 -FirewallIpAddress 203.0.113.25 -FirewallIpAction Block -FirewallAddress Remote
 .NOTES
 The Bitdefender window is launched and brought to the foreground as needed.
 -CurrentPage and -ListControls are optional troubleshooting tools.
@@ -24,9 +30,9 @@ manually. The script waits up to ConfirmationTimeoutSeconds (default 60).
 Cycle temporarily changes the setting and attempts restoration in finally.
 Do not run concurrently with another instance or interact with other pages.
 #>
-[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
+[CmdletBinding(DefaultParameterSetName = 'ProtectionSetting', SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
 param(
-    [Parameter(Mandatory = $true)]
+    [Parameter(Mandatory = $true, ParameterSetName = 'ProtectionSetting')]
     [ValidateSet(
         'RansomwareRemediation', 'CryptominingProtection', 'Firewall', 'Antispam',
         'AdvancedThreatDefense', 'ExploitDetection', 'BitdefenderShield',
@@ -37,15 +43,27 @@ param(
     )]
     [string]$Setting,
 
-    [Parameter(Mandatory = $true)]
+    [Parameter(Mandatory = $true, ParameterSetName = 'ProtectionSetting')]
     [ValidateSet('On', 'Off', 'Status', 'Cycle')]
     [string]$State,
+
+    [Parameter(Mandatory = $true, ParameterSetName = 'FirewallIpRule')]
+    [ValidateSet('Allow', 'Block', 'Deny')]
+    [string]$FirewallIpAction,
+
+    [Parameter(Mandatory = $true, ParameterSetName = 'FirewallIpRule')]
+    [string]$FirewallIpAddress,
+
+    [Parameter(ParameterSetName = 'FirewallIpRule')]
+    [ValidateSet('Remote', 'Local')]
+    [string]$FirewallAddress = 'Remote',
 
     [switch]$CurrentPage,
     [switch]$ListControls,
 
     # Optional override from -ListControls for builds with unnamed switches.
     # Only use an ID you have confirmed belongs to the intended switch.
+    [Parameter(ParameterSetName = 'ProtectionSetting')]
     [string]$AutomationId,
 
     [ValidateRange(5, 600)]
@@ -75,16 +93,35 @@ $settingMap = @{
     ScanKeyloggers = @{ Page = 'Antivirus'; Id = 'scan_keyloggers'; Labels = @('Scan keyloggers') }
     EarlyBootScan = @{ Page = 'Antivirus'; Id = 'scan_early_boot'; Labels = @('Early boot scan') }
 }
-$definition = $settingMap[$Setting]
+$isFirewallIpRule = ($PSCmdlet.ParameterSetName -eq 'FirewallIpRule')
+$definition = if ($isFirewallIpRule) { $null } else { $settingMap[$Setting] }
+$normalizedFirewallIpAddress = $null
+$normalizedFirewallPermission = $null
+if ($isFirewallIpRule) {
+    $parsedFirewallIpAddress = $null
+    if (-not [System.Net.IPAddress]::TryParse($FirewallIpAddress, [ref]$parsedFirewallIpAddress)) {
+        throw "Invalid IP address: $FirewallIpAddress"
+    }
+    $normalizedFirewallIpAddress = $parsedFirewallIpAddress.ToString()
+    $normalizedFirewallPermission = if ($FirewallIpAction -eq 'Allow') { 'Allow' } else { 'Deny' }
+}
 
 # WhatIf does not open or navigate the Bitdefender UI.
 if ($WhatIfPreference) {
-    [void]$PSCmdlet.ShouldProcess("Bitdefender / $Setting", "$State (page: $($definition.Page))")
+    if ($isFirewallIpRule) {
+        [void]$PSCmdlet.ShouldProcess(
+            "Bitdefender Firewall / $FirewallAddress address $normalizedFirewallIpAddress",
+            "Add $normalizedFirewallPermission all-applications rule"
+        )
+    } else {
+        [void]$PSCmdlet.ShouldProcess("Bitdefender / $Setting", "$State (page: $($definition.Page))")
+    }
     return
 }
 
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
+Add-Type -AssemblyName System.Windows.Forms
 
 if (-not ('BitdefenderNativeMouse' -as [type])) {
     Add-Type @'
@@ -160,6 +197,18 @@ function Test-Visible {
     return (-not $Element.Current.IsOffscreen -and $bounds.Width -gt 0 -and $bounds.Height -gt 0)
 }
 
+function Get-ParentElement {
+    param($Element)
+    if ($null -eq $Element) { return $null }
+    if ($Element -is [array]) {
+        if ($Element.Count -ne 1) { return $null }
+        $Element = $Element[0]
+    }
+    $automationElement = $Element -as [System.Windows.Automation.AutomationElement]
+    if ($null -eq $automationElement) { return $null }
+    return ([System.Windows.Automation.TreeWalker]::ControlViewWalker).GetParent($automationElement)
+}
+
 function Get-BitdefenderWindow {
     $root = [System.Windows.Automation.AutomationElement]::RootElement
     $deadline = (Get-Date).AddSeconds(20)
@@ -168,9 +217,26 @@ function Get-BitdefenderWindow {
         $windows = @($root.FindAll(
             [System.Windows.Automation.TreeScope]::Children,
             [System.Windows.Automation.Condition]::TrueCondition
-        ) | Where-Object { $_.Current.Name -eq 'Bitdefender Security Center' })
-        if ($windows.Count -eq 1) { return $windows[0] }
-        if ($windows.Count -gt 1) { throw 'Multiple Bitdefender windows found. Close extra windows and retry.' }
+        ) | Where-Object {
+            $_.Current.Name -in @('Bitdefender Security Center', 'Bitdefender Firewall') -and
+            (Test-Visible $_)
+        })
+        if ($windows.Count -gt 0) {
+            $foregroundHandle = [BitdefenderWindowFocus20260926]::GetForegroundWindow()
+            $foreground = @($windows | Where-Object {
+                [IntPtr]$_.Current.NativeWindowHandle -eq $foregroundHandle
+            })
+            if ($foreground.Count -eq 1) { return $foreground[0] }
+
+            $firewallDialogs = @($windows | Where-Object { $_.Current.Name -eq 'Bitdefender Firewall' })
+            if ($firewallDialogs.Count -eq 1) { return $firewallDialogs[0] }
+
+            $securityCenters = @($windows | Where-Object { $_.Current.Name -eq 'Bitdefender Security Center' })
+            if ($securityCenters.Count -eq 1) { return $securityCenters[0] }
+
+            if ($windows.Count -eq 1) { return $windows[0] }
+            throw 'Multiple Bitdefender windows found. Close extra windows and retry.'
+        }
         if (-not $launched) {
             $path = 'C:\Program Files\Bitdefender\Bitdefender Security App\seccenter.exe'
             if (-not (Test-Path -LiteralPath $path)) { throw "Bitdefender was not found at $path. Open it manually and retry." }
@@ -292,6 +358,571 @@ function Wait-ActionByNameAndId {
     throw "Could not uniquely identify '$Name' (AutomationId $AutomationId)."
 }
 
+function Get-NamedVisibleElement {
+    param($Root, [string[]]$Names, $ControlType = $null)
+    @(Get-Elements $Root | Where-Object {
+        ($Names -contains ([string]$_.Current.Name).Trim()) -and
+        ($null -eq $ControlType -or $_.Current.ControlType -eq $ControlType) -and
+        (Test-Visible $_)
+    })
+}
+
+function Wait-NamedVisibleElement {
+    param($Root, [string[]]$Names, $ControlType = $null)
+    $deadline = (Get-Date).AddSeconds(8)
+    do {
+        $matches = @(Get-NamedVisibleElement $Root $Names $ControlType)
+        if ($matches.Count -eq 1) { return $matches[0] }
+        if ($matches.Count -gt 1) {
+            $actionMatches = @($matches | Where-Object {
+                (Get-Pattern $_ ([System.Windows.Automation.InvokePattern]::Pattern)) -or
+                (Get-Pattern $_ ([System.Windows.Automation.SelectionItemPattern]::Pattern))
+            })
+            if ($actionMatches.Count -eq 1) { return $actionMatches[0] }
+        }
+        Start-Sleep -Milliseconds 250
+    } while ((Get-Date) -lt $deadline)
+    throw "Could not uniquely identify '$($Names -join ' / ')'. Open the required page manually and use -CurrentPage."
+}
+
+function Get-DistinctElements {
+    param([object[]]$Elements)
+    $seen = @{}
+    $result = @()
+    foreach ($element in $Elements) {
+        if ($null -eq $element) { continue }
+        $key = $element.GetRuntimeId() -join '.'
+        if (-not $seen.ContainsKey($key)) {
+            $seen[$key] = $true
+            $result += $element
+        }
+    }
+    return $result
+}
+
+function Get-SwitchByLabels {
+    param($Root, [string[]]$Labels)
+    $switches = @(Get-Switches $Root | Where-Object { Test-Visible $_ })
+    $matches = @($switches | Where-Object {
+        $labelledBy = $_.Current.LabeledBy
+        ($Labels -contains ([string]$_.Current.Name).Trim()) -or
+        ($null -ne $labelledBy -and $Labels -contains ([string]$labelledBy.Current.Name).Trim())
+    })
+    if ($matches.Count -eq 0) {
+        $found = @{}
+        $labels = @(Get-Elements $Root | Where-Object {
+            ($Labels -contains ([string]$_.Current.Name).Trim()) -and (Test-Visible $_)
+        })
+        foreach ($label in $labels) {
+            $node = Get-ParentElement $label
+            for ($level = 0; $level -lt 5 -and $null -ne $node; $level++) {
+                if ([System.Windows.Automation.Automation]::Compare($node, $Root)) { break }
+                $rowSwitches = @(Get-Switches $node | Where-Object { Test-Visible $_ })
+                if ($rowSwitches.Count -eq 1) {
+                    $found[($rowSwitches[0].GetRuntimeId() -join '.')] = $rowSwitches[0]
+                    break
+                }
+                if ($rowSwitches.Count -gt 1) { break }
+                $node = Get-ParentElement $node
+            }
+        }
+        $matches = @($found.Values)
+    }
+    if ($matches.Count -ne 1) {
+        $observed = @($switches | ForEach-Object {
+            $name = ([string]$_.Current.Name).Trim()
+            $id = $_.Current.AutomationId
+            if ($name -or $id) { "$name [$id]" }
+        } | Sort-Object -Unique)
+        throw "Found $($matches.Count) matching switches for '$($Labels -join ' / ')'. Observed switches: $($observed -join ', ')."
+    }
+    return $matches[0]
+}
+
+function Get-SwitchByAutomationId {
+    param($Root, [string[]]$AutomationIds, [string]$Description)
+    $switches = @(Get-Switches $Root | Where-Object { Test-Visible $_ })
+    $ids = @($AutomationIds | ForEach-Object { [string]$_ })
+    $matches = @($switches | Where-Object { $ids -contains ([string]$_.Current.AutomationId) })
+    if ($matches.Count -gt 1) {
+        $unique = @{}
+        foreach ($match in $matches) {
+            $bounds = $match.Current.BoundingRectangle
+            $toggle = Get-Pattern $match ([System.Windows.Automation.TogglePattern]::Pattern)
+            $state = if ($toggle) { $toggle.Current.ToggleState.ToString() } else { '' }
+            $key = @(
+                [string]$match.Current.AutomationId,
+                [string]$match.Current.ControlType.ProgrammaticName,
+                [string]$match.Current.IsEnabled,
+                [string]$state,
+                [string][math]::Round($bounds.X),
+                [string][math]::Round($bounds.Y),
+                [string][math]::Round($bounds.Width),
+                [string][math]::Round($bounds.Height)
+            ) -join '|'
+            if (-not $unique.ContainsKey($key)) { $unique[$key] = $match }
+        }
+        $matches = @($unique.Values)
+    }
+    if ($matches.Count -ne 1) {
+        $observed = @($switches | ForEach-Object {
+            $name = ([string]$_.Current.Name).Trim()
+            $id = $_.Current.AutomationId
+            if ($name -or $id) { "$name [$id]" }
+        } | Sort-Object -Unique)
+        throw "Found $($matches.Count) matching switches for $Description. Expected IDs: $($ids -join ', '). Observed switches: $($observed -join ', ')."
+    }
+    return $matches[0]
+}
+
+function Get-ElementByAutomationId {
+    param($Root, [string[]]$AutomationIds, $ControlType = $null, [string]$Description)
+    $ids = @($AutomationIds | ForEach-Object { [string]$_ })
+    $matches = @(Get-Elements $Root | Where-Object {
+        ($ids -contains ([string]$_.Current.AutomationId)) -and
+        ($null -eq $ControlType -or $_.Current.ControlType -eq $ControlType) -and
+        (Test-Visible $_)
+    })
+    if ($matches.Count -gt 1) {
+        $unique = @{}
+        foreach ($match in $matches) {
+            $bounds = $match.Current.BoundingRectangle
+            $key = @(
+                [string]$match.Current.AutomationId,
+                [string]$match.Current.ControlType.ProgrammaticName,
+                [string]$match.Current.IsEnabled,
+                [string][math]::Round($bounds.X),
+                [string][math]::Round($bounds.Y),
+                [string][math]::Round($bounds.Width),
+                [string][math]::Round($bounds.Height)
+            ) -join '|'
+            if (-not $unique.ContainsKey($key)) { $unique[$key] = $match }
+        }
+        $matches = @($unique.Values)
+    }
+    if ($matches.Count -ne 1) {
+        throw "Found $($matches.Count) matching elements for $Description. Expected IDs: $($ids -join ', ')."
+    }
+    return $matches[0]
+}
+
+function Set-ToggleElementState {
+    param(
+        $Element,
+        [ValidateSet('On', 'Off')][string]$DesiredState,
+        [string]$Description
+    )
+    $toggle = Get-Pattern $Element ([System.Windows.Automation.TogglePattern]::Pattern)
+    if (-not $toggle) { throw "$Description is not a toggle control." }
+    if ($toggle.Current.ToggleState.ToString() -eq $DesiredState) { return }
+    $invoke = Get-Pattern $Element ([System.Windows.Automation.InvokePattern]::Pattern)
+    if ($invoke) { $invoke.Invoke() }
+    else { $toggle.Toggle() }
+    $deadline = (Get-Date).AddSeconds(2)
+    do {
+        Start-Sleep -Milliseconds 250
+        $toggle = Get-Pattern $Element ([System.Windows.Automation.TogglePattern]::Pattern)
+        if ($toggle -and $toggle.Current.ToggleState.ToString() -eq $DesiredState) { return }
+    } while ((Get-Date) -lt $deadline)
+
+    Invoke-Control -Element $Element -ForceMouseClick
+    $deadline = (Get-Date).AddSeconds(6)
+    do {
+        Start-Sleep -Milliseconds 250
+        $toggle = Get-Pattern $Element ([System.Windows.Automation.TogglePattern]::Pattern)
+        if ($toggle -and $toggle.Current.ToggleState.ToString() -eq $DesiredState) { return }
+    } while ((Get-Date) -lt $deadline)
+    throw "Could not verify $Description = $DesiredState."
+}
+
+function Get-SwitchByRowLabel {
+    param($Root, [string[]]$Labels)
+    $labelElements = @(Get-Elements $Root | Where-Object {
+        ($Labels -contains ([string]$_.Current.Name).Trim()) -and (Test-Visible $_)
+    })
+    $switches = @(Get-Switches $Root | Where-Object { Test-Visible $_ })
+    $candidates = @()
+    foreach ($label in $labelElements) {
+        $labelBounds = $label.Current.BoundingRectangle
+        $labelCenterX = $labelBounds.X + ($labelBounds.Width / 2)
+        $labelCenterY = $labelBounds.Y + ($labelBounds.Height / 2)
+        foreach ($switch in $switches) {
+            $switchBounds = $switch.Current.BoundingRectangle
+            $switchCenterX = $switchBounds.X + ($switchBounds.Width / 2)
+            $switchCenterY = $switchBounds.Y + ($switchBounds.Height / 2)
+            if ($switchCenterX -lt $labelCenterX) { continue }
+            $verticalDistance = [math]::Abs($switchCenterY - $labelCenterY)
+            if ($verticalDistance -gt 35) { continue }
+            $candidates += [pscustomobject]@{
+                Element = $switch
+                Score = $verticalDistance + (($switchCenterX - $labelCenterX) / 100)
+            }
+        }
+    }
+    $ordered = @($candidates | Sort-Object Score)
+    if ($ordered.Count -gt 0) { return $ordered[0].Element }
+    return Get-SwitchByLabels -Root $Root -Labels $Labels
+}
+
+function Invoke-ModuleAction {
+    param($Window, [string]$ModuleName, [string[]]$ActionNames)
+    $moduleActionIds = @{
+        Firewall = @('2', 'idSettings', 'idSettingsButton', 'idFirewallSettings', 'firewall_settings')
+    }
+    $moduleAnchorIds = @{
+        Firewall = @('2')
+    }
+    if ($moduleActionIds.ContainsKey($ModuleName)) {
+        foreach ($automationId in $moduleActionIds[$ModuleName]) {
+            $directActions = @(Get-Elements $Window | Where-Object {
+                ($ActionNames -contains ([string]$_.Current.Name).Trim()) -and
+                $_.Current.AutomationId -eq $automationId -and
+                (Test-Visible $_)
+            })
+            if ($directActions.Count -eq 1) {
+                Invoke-Control -Element $directActions[0] -ForceMouseClick
+                return
+            }
+        }
+    }
+
+    $labels = @(Get-Elements $Window | Where-Object {
+        ([string]$_.Current.Name).Trim() -eq $ModuleName -and (Test-Visible $_)
+    })
+    $anchors = @($labels)
+    if ($moduleAnchorIds.ContainsKey($ModuleName)) {
+        $anchors += @(Get-Elements $Window | Where-Object {
+            ($moduleAnchorIds[$ModuleName] -contains $_.Current.AutomationId) -and (Test-Visible $_)
+        })
+        $anchors = @(Get-DistinctElements $anchors)
+    }
+    $found = @{}
+    foreach ($anchor in $anchors) {
+        $node = $anchor
+        for ($level = 0; $level -lt 10 -and $null -ne $node; $level++) {
+            if ([System.Windows.Automation.Automation]::Compare($node, $Window)) { break }
+            $actions = @(Get-Elements $node | Where-Object {
+                ($ActionNames -contains ([string]$_.Current.Name).Trim()) -and (Test-Visible $_)
+            })
+            if ($actions.Count -eq 1) {
+                $found[($actions[0].GetRuntimeId() -join '.')] = $actions[0]
+                break
+            }
+            if ($actions.Count -gt 1) {
+                $actionable = @($actions | Where-Object {
+                    (Get-Pattern $_ ([System.Windows.Automation.InvokePattern]::Pattern)) -or
+                    (Get-Pattern $_ ([System.Windows.Automation.SelectionItemPattern]::Pattern))
+                })
+                if ($actionable.Count -eq 1) {
+                    $found[($actionable[0].GetRuntimeId() -join '.')] = $actionable[0]
+                    break
+                }
+            }
+            $node = Get-ParentElement $node
+        }
+    }
+    if ($found.Count -eq 0 -and $anchors.Count -gt 0) {
+        $actions = @(Get-Elements $Window | Where-Object {
+            ($ActionNames -contains ([string]$_.Current.Name).Trim()) -and (Test-Visible $_)
+        })
+        $candidates = @()
+        foreach ($anchor in $anchors) {
+            $labelBounds = $anchor.Current.BoundingRectangle
+            $labelCenterX = $labelBounds.X + ($labelBounds.Width / 2)
+            $labelCenterY = $labelBounds.Y + ($labelBounds.Height / 2)
+            foreach ($action in $actions) {
+                $actionBounds = $action.Current.BoundingRectangle
+                $actionCenterX = $actionBounds.X + ($actionBounds.Width / 2)
+                $actionCenterY = $actionBounds.Y + ($actionBounds.Height / 2)
+                $score = [math]::Abs($actionCenterY - $labelCenterY) + ([math]::Abs($actionCenterX - $labelCenterX) / 8)
+                if ($actionCenterX -gt $labelCenterX) { $score -= 25 }
+                $candidates += [pscustomobject]@{ Element = $action; Score = $score }
+            }
+        }
+        $nearest = @($candidates | Sort-Object Score | Select-Object -First 2)
+        if ($nearest.Count -eq 1 -or ($nearest.Count -eq 2 -and ($nearest[1].Score - $nearest[0].Score) -gt 5)) {
+            $found[($nearest[0].Element.GetRuntimeId() -join '.')] = $nearest[0].Element
+        }
+    }
+    if ($found.Count -ne 1) {
+        $observedActions = @(Get-Elements $Window | Where-Object {
+            (Test-Visible $_) -and
+            (([string]$_.Current.Name).Trim() -match '^(Open|Settings|Manage settings|Manage Settings)$')
+        } | ForEach-Object {
+            "$(([string]$_.Current.Name).Trim()) [$($_.Current.AutomationId)]"
+        } | Sort-Object -Unique)
+        throw "Could not identify the $($ActionNames -join ' / ') action for $ModuleName. Observed module actions: $($observedActions -join ', '). Run again with -ListControls for diagnostics."
+    }
+    Invoke-Control -Element (@($found.Values)[0]) -ForceMouseClick
+}
+
+function Set-TextElementValue {
+    param($Element, [string]$Value, [string]$Description)
+    if (-not $Element.Current.IsEnabled) { throw "$Description is disabled." }
+    $valuePattern = Get-Pattern $Element ([System.Windows.Automation.ValuePattern]::Pattern)
+    if ($valuePattern -and -not $valuePattern.Current.IsReadOnly) {
+        $valuePattern.SetValue($Value)
+        Start-Sleep -Milliseconds 200
+        return
+    }
+    Invoke-Control -Element $Element -ForceMouseClick
+    Start-Sleep -Milliseconds 150
+    [System.Windows.Forms.SendKeys]::SendWait('^a')
+    Start-Sleep -Milliseconds 100
+    [System.Windows.Forms.SendKeys]::SendWait($Value)
+    Start-Sleep -Milliseconds 200
+}
+
+function Set-FirewallRulePermission {
+    param($Root, [ValidateSet('Allow', 'Deny')][string]$Permission)
+    $desiredState = if ($Permission -eq 'Allow') { 'On' } else { 'Off' }
+    $permissionSwitch = Get-SwitchByAutomationId -Root $Root -AutomationIds @('rules_edit_perm') -Description 'Firewall rule permission'
+    Set-ToggleElementState -Element $permissionSwitch -DesiredState $desiredState -Description "Firewall rule permission ($Permission)"
+}
+
+function Show-FirewallAdvancedSettings {
+    param($Root)
+    $advancedControls = @(Get-Elements $Root | Where-Object {
+        $_.Current.AutomationId -in @(
+            'rules_edit_localports',
+            'rules_edit_remoteports',
+            'rules_edit_localports_ip',
+            'rules_edit_remoteports_ip'
+        ) -and
+        (Test-Visible $_)
+    })
+    if ($advancedControls.Count -gt 0) { return }
+
+    $alreadyOpen = @(Get-NamedVisibleElement $Root @(
+        'Hide advanced settings',
+        'Hide Advanced Settings',
+        'Hide advanced options',
+        'Hide Advanced Options'
+    ))
+    if ($alreadyOpen.Count -gt 0) { return }
+
+    $showById = @(Get-Elements $Root | Where-Object {
+        $_.Current.AutomationId -eq 'id_showhide_advanced' -and (Test-Visible $_)
+    })
+    if ($showById.Count -gt 0) {
+        Invoke-Control -Element $showById[0] -ForceMouseClick
+        Start-Sleep -Milliseconds 500
+        return
+    }
+
+    $show = @(Get-NamedVisibleElement $Root @(
+        'Show advanced settings',
+        'Show Advanced Settings',
+        'Show advanced options',
+        'Show Advanced Options',
+        'Advanced Settings'
+    ))
+    if ($show.Count -ne 1) {
+        throw 'Could not find the firewall rule advanced settings toggle.'
+    }
+    Invoke-Control -Element $show[0] -ForceMouseClick
+    Start-Sleep -Milliseconds 500
+}
+
+function Set-FirewallAddressField {
+    param(
+        [ValidateSet('Remote', 'Local')][string]$AddressKind,
+        [string]$Address
+    )
+    $window = Get-BitdefenderWindow
+    $labels = @("Custom $AddressKind Address", "Custom $AddressKind Address:")
+    $addressSwitchId = if ($AddressKind -eq 'Remote') { 'rules_edit_remoteports' } else { 'rules_edit_localports' }
+    $addressSwitch = Get-SwitchByAutomationId -Root $window -AutomationIds @($addressSwitchId) -Description "Custom $AddressKind Address"
+    Set-ToggleElementState -Element $addressSwitch -DesiredState 'On' -Description "Custom $AddressKind Address"
+    Start-Sleep -Milliseconds 500
+
+    $window = Get-BitdefenderWindow
+    $addressInputId = if ($AddressKind -eq 'Remote') { 'rules_edit_remoteports_ip' } else { 'rules_edit_localports_ip' }
+    $addressInput = Get-ElementByAutomationId -Root $window -AutomationIds @($addressInputId) -ControlType ([System.Windows.Automation.ControlType]::Edit) -Description "Custom $AddressKind Address IP field"
+    Set-TextElementValue $addressInput $Address "Custom $AddressKind Address"
+    return
+
+    $labelElements = @(Get-Elements $window | Where-Object {
+        ($labels -contains ([string]$_.Current.Name).Trim()) -and (Test-Visible $_)
+    })
+    $candidates = @()
+    foreach ($label in $labelElements) {
+        $labelBounds = $label.Current.BoundingRectangle
+        $node = Get-ParentElement $label
+        for ($level = 0; $level -lt 7 -and $null -ne $node; $level++) {
+            if ([System.Windows.Automation.Automation]::Compare($node, $window)) { break }
+            $edits = @(Get-Elements $node | Where-Object {
+                $_.Current.ControlType -eq [System.Windows.Automation.ControlType]::Edit -and
+                $_.Current.IsEnabled -and
+                (Test-Visible $_)
+            })
+            foreach ($edit in $edits) {
+                $editText = "$($edit.Current.Name) $($edit.Current.AutomationId)"
+                $editBounds = $edit.Current.BoundingRectangle
+                $score = [math]::Abs(($editBounds.Y + ($editBounds.Height / 2)) - ($labelBounds.Y + ($labelBounds.Height / 2)))
+                if ($editText -match '(?i)\b(port|ports)\b') { $score += 10000 }
+                if ($editText -match '(?i)(ip|address)') { $score -= 1000 }
+                $candidates += [pscustomobject]@{
+                    Element = $edit
+                    Score = $score
+                    X = $editBounds.X
+                }
+            }
+            if ($candidates.Count -gt 0) { break }
+            $node = Get-ParentElement $node
+        }
+    }
+    $candidateElements = @(Get-DistinctElements @($candidates | Sort-Object Score, X | ForEach-Object { $_.Element }))
+    if ($candidateElements.Count -eq 0) {
+        throw "Could not find the Custom $AddressKind Address input field."
+    }
+    Set-TextElementValue $candidateElements[0] $Address "Custom $AddressKind Address"
+}
+
+function Open-FirewallRulesPage {
+    if ($CurrentPage) { return }
+    $window = Get-BitdefenderWindow
+    $readyDeadline = (Get-Date).AddSeconds(30)
+    do {
+        $elements = @(Get-Elements $window)
+        $serviceError = @($elements | Where-Object {
+            $_.Current.AutomationId -eq 'idMsgTitle' -and
+            ([string]$_.Current.Name) -eq 'Communication failure'
+        })
+        if ($serviceError.Count -gt 0) {
+            throw 'Bitdefender reports a communication failure with its App Service. The app must reconnect before firewall rules can be changed.'
+        }
+        $navigation = @($elements | Where-Object {
+            $_.Current.AutomationId -eq 'liProtection' -and (Test-Visible $_)
+        })
+        if ($navigation.Count -eq 1) { break }
+        Start-Sleep -Milliseconds 350
+    } while ((Get-Date) -lt $readyDeadline)
+    if ($navigation.Count -ne 1) { throw 'Bitdefender did not load its Protection navigation within 30 seconds.' }
+    Invoke-Control -Element $navigation[0] -ForceMouseClick
+    Start-Sleep -Milliseconds 800
+
+    $window = Get-BitdefenderWindow
+    Invoke-ModuleAction $window 'Firewall' @('Settings', 'Open', 'Manage settings', 'Manage Settings')
+    Start-Sleep -Milliseconds 700
+
+    $window = Get-BitdefenderWindow
+    $rulesTab = Wait-NamedVisibleElement $window @('Rules') $null
+    Invoke-Control -Element $rulesTab -ForceMouseClick
+    Start-Sleep -Milliseconds 500
+}
+
+function Test-FirewallRuleEditorOpen {
+    param($Root)
+    $allApplications = @(Get-NamedVisibleElement $Root @(
+        'Apply this rule to all applications',
+        'Apply this rule to all applications.'
+    ))
+    if ($allApplications.Count -gt 0) { return $true }
+
+    $addressLabels = @(Get-NamedVisibleElement $Root @(
+        'Custom Remote Address',
+        'Custom Remote Address:',
+        'Custom Local Address',
+        'Custom Local Address:'
+    ))
+    $saveActions = @(Get-NamedVisibleElement $Root @('Save', 'OK'))
+    return ($addressLabels.Count -gt 0 -and $saveActions.Count -gt 0)
+}
+
+function Open-FirewallRuleEditor {
+    $window = Get-BitdefenderWindow
+    if (Test-FirewallRuleEditorOpen $window) { return }
+
+    Open-FirewallRulesPage
+    $window = Get-BitdefenderWindow
+    if (Test-FirewallRuleEditorOpen $window) { return }
+
+    $addRule = Wait-NamedVisibleElement $window @(
+        'Add rule',
+        'Add Rule',
+        '+ Add rule',
+        '+ Add Rule',
+        'Add',
+        'New rule',
+        'New Rule'
+    ) $null
+    Invoke-Control -Element $addRule -ForceMouseClick
+
+    $deadline = (Get-Date).AddSeconds(8)
+    do {
+        Start-Sleep -Milliseconds 300
+        $window = Get-BitdefenderWindow
+        if (Test-FirewallRuleEditorOpen $window) { return }
+    } while ((Get-Date) -lt $deadline)
+    throw 'The Add rule editor did not open after clicking Add rule.'
+}
+
+function Close-FirewallRuleEditorIfOpen {
+    $window = Get-BitdefenderWindow
+    if (-not (Test-FirewallRuleEditorOpen $window)) { return }
+
+    $cancel = Wait-NamedVisibleElement $window @('Cancel') $null
+    Invoke-Control -Element $cancel -ForceMouseClick
+
+    $deadline = (Get-Date).AddSeconds(8)
+    do {
+        Start-Sleep -Milliseconds 300
+        $window = Get-BitdefenderWindow
+        if (-not (Test-FirewallRuleEditorOpen $window)) { return }
+    } while ((Get-Date) -lt $deadline)
+    throw 'The existing firewall rule editor did not close after clicking Cancel.'
+}
+
+function Add-FirewallIpRule {
+    if (-not $CurrentPage) {
+        Close-FirewallRuleEditorIfOpen
+    }
+    Open-FirewallRuleEditor
+
+    $window = Get-BitdefenderWindow
+    $allApplications = Get-SwitchByAutomationId -Root $window -AutomationIds @('rule_all_applications') -Description 'Apply this rule to all applications'
+    Set-ToggleElementState -Element $allApplications -DesiredState 'On' -Description 'Apply this rule to all applications'
+    Start-Sleep -Milliseconds 300
+
+    $window = Get-BitdefenderWindow
+    Set-FirewallRulePermission $window $normalizedFirewallPermission
+    Start-Sleep -Milliseconds 300
+
+    $window = Get-BitdefenderWindow
+    Show-FirewallAdvancedSettings $window
+    Set-FirewallAddressField $FirewallAddress $normalizedFirewallIpAddress
+
+    $window = Get-BitdefenderWindow
+    $save = Wait-NamedVisibleElement $window @('Save', 'OK') $null
+    Invoke-Control -Element $save -ForceMouseClick
+
+    $deadline = (Get-Date).AddSeconds($ConfirmationTimeoutSeconds)
+    $lastObservation = 'Save clicked'
+    do {
+        Start-Sleep -Milliseconds 500
+        try {
+            $window = Get-BitdefenderWindow
+            $saveStillVisible = @(Get-NamedVisibleElement $window @('Save', 'OK'))
+            if ($saveStillVisible.Count -eq 0 -and -not (Test-ModalDialog)) {
+                return [pscustomobject]@{
+                    Timestamp = (Get-Date).ToString('o')
+                    RuleType = 'FirewallIpRule'
+                    AddressType = $FirewallAddress
+                    IpAddress = $normalizedFirewallIpAddress
+                    Permission = $normalizedFirewallPermission
+                    Scope = 'All applications'
+                    VerificationSource = 'Bitdefender consumer Firewall Rules UI'
+                }
+            }
+            $lastObservation = "Save/OK controls still visible: $($saveStillVisible.Count)"
+        } catch {
+            $lastObservation = $_.Exception.Message
+        }
+    } while ((Get-Date) -lt $deadline)
+    throw "Could not verify that the firewall IP rule was saved within $ConfirmationTimeoutSeconds seconds. Last observation: $lastObservation."
+}
+
 function Open-Module {
     param($Window, [string]$ModuleName)
     $moduleIds = @{
@@ -340,7 +971,7 @@ function Open-Module {
                 break
             }
             if ($actions.Count -gt 1) { break }
-            $node = [System.Windows.Automation.TreeWalker]::ControlViewWalker.GetParent($node)
+            $node = Get-ParentElement $node
         }
     }
     if ($found.Count -ne 1) {
@@ -427,7 +1058,7 @@ function Get-SettingCheckbox {
             $otherLabels = @($settingMap.Keys | Where-Object { $_ -ne $Setting } |
                 ForEach-Object { $settingMap[$_].Labels })
             foreach ($label in $labels) {
-                $node = [System.Windows.Automation.TreeWalker]::ControlViewWalker.GetParent($label)
+                $node = Get-ParentElement $label
                 for ($level = 0; $level -lt 3 -and $null -ne $node; $level++) {
                     if ([System.Windows.Automation.Automation]::Compare($node, $window)) { break }
                     $children = @(Get-Elements $node)
@@ -438,7 +1069,7 @@ function Get-SettingCheckbox {
                         break
                     }
                     if ($rowSwitches.Count -gt 1) { break }
-                    $node = [System.Windows.Automation.TreeWalker]::ControlViewWalker.GetParent($node)
+                    $node = Get-ParentElement $node
                 }
             }
             $matches = @($found.Values)
@@ -540,22 +1171,13 @@ function Set-UiState {
     throw "Could not verify $Setting = $DesiredState within $ConfirmationTimeoutSeconds seconds. Last observation: $lastObservation. Check the app and any pending dialog before retrying."
 }
 
-$commandCompleted = $false
-try {
-    $navigationError = $null
-    if ($ListControls) {
-        try { Open-SettingPage }
-        catch { $navigationError = $_.Exception.Message }
-    } else {
-        Open-SettingPage
-    }
-
-    if ($ListControls) {
+function Write-ControlInventory {
+    param([string]$NavigationError)
     $window = Get-BitdefenderWindow
     $controlInventory = @(Get-Elements $window | ForEach-Object {
         $toggle = Get-Pattern $_ ([System.Windows.Automation.TogglePattern]::Pattern)
         $bounds = $_.Current.BoundingRectangle
-        $parent = [System.Windows.Automation.TreeWalker]::ControlViewWalker.GetParent($_)
+        $parent = Get-ParentElement $_
         [pscustomobject]@{
             Name = $_.Current.Name
             AutomationId = $_.Current.AutomationId
@@ -573,10 +1195,10 @@ try {
             ParentAutomationId = if ($parent) { $parent.Current.AutomationId } else { $null }
         }
     })
-    if ($navigationError) {
+    if ($NavigationError) {
         @([pscustomobject]@{
             Name = 'NAVIGATION ERROR'
-            NavigationError = $navigationError
+            NavigationError = $NavigationError
             AutomationId = $null
             ControlType = 'Diagnostic'
             ToggleState = $null
@@ -584,6 +1206,51 @@ try {
     } else {
         $controlInventory | ConvertTo-Json -Depth 5
     }
+}
+
+$commandCompleted = $false
+try {
+    if ($isFirewallIpRule) {
+        $navigationError = $null
+        if ($ListControls) {
+            try { Open-FirewallRulesPage }
+            catch { $navigationError = $_.Exception.Message }
+            Write-ControlInventory $navigationError
+            $commandCompleted = $true
+            return
+        }
+
+        if (-not $PSCmdlet.ShouldProcess(
+            "Bitdefender Firewall / $FirewallAddress address $normalizedFirewallIpAddress",
+            "Add $normalizedFirewallPermission all-applications rule"
+        )) {
+            $commandCompleted = $true
+            return
+        }
+
+        $result = Add-FirewallIpRule
+        [pscustomobject]@{
+            FirewallIpAddress = $normalizedFirewallIpAddress
+            FirewallIpAction = $FirewallIpAction
+            Permission = $normalizedFirewallPermission
+            AddressType = $FirewallAddress
+            Result = $result
+            Passed = ($result.IpAddress -eq $normalizedFirewallIpAddress -and $result.Permission -eq $normalizedFirewallPermission)
+        } | ConvertTo-Json -Depth 8
+        $commandCompleted = $true
+        return
+    }
+
+    $navigationError = $null
+    if ($ListControls) {
+        try { Open-SettingPage }
+        catch { $navigationError = $_.Exception.Message }
+    } else {
+        Open-SettingPage
+    }
+
+    if ($ListControls) {
+        Write-ControlInventory $navigationError
         $commandCompleted = $true
         return
     }
